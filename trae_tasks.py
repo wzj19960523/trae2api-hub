@@ -471,7 +471,11 @@ def _do_refresh(account):
 
 
 def _iter_accounts(pool=None, accounts=None, realm=None, include_disabled=False):
-    """统一账号遍历：显式 accounts 优先，其次 pool.accounts。"""
+    """统一账号遍历：显式 accounts 优先，其次 pool.accounts。
+
+    显式 accounts 列表同样执行 enabled 过滤（issue：手动 /tasks/run 曾对
+    禁用账号签到）。仅当 include_disabled=True（如到期提醒）才放行禁用账号。
+    """
     if accounts is not None:
         source = list(accounts)
     elif pool is not None:
@@ -1459,6 +1463,15 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
             snapshot[uid] = {"ok": False, "skipped": True,
                              "reason": "intl_no_checkin", "earned_credit": 0}
             continue
+        # 禁用账号：默认跳过；仅当显式勾选「禁用仍签到」才继续
+        if not bool(getattr(account, "enabled", True)):
+            if not bool(getattr(account, "checkin_when_disabled", False)):
+                skipped += 1
+                logs.append("— [%s] 账号已禁用，跳过签到" % name)
+                snapshot[uid] = {"ok": False, "skipped": True,
+                                 "reason": "account_disabled", "earned_credit": 0}
+                continue
+            logs.append("… [%s] 账号已禁用，但勾选了「禁用仍签到」，继续" % name)
         if calls_made:
             delay = _pace(pacing, calls_made, waits)
             paced_seconds += delay

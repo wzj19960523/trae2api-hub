@@ -1,0 +1,399 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ceeea7f..509d423 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,26 @@
++## [1.7.0-local.1] - 2026-11-19
++
++> **本地补丁版本（非上游）**：本条目记录本机自用时的改动，上游仓库不含这些提交。
++> 完整证据链、事故复盘与升级/回滚指引见 [docs/local-patches/LOCAL_PATCHES.md](docs/local-patches/LOCAL_PATCHES.md)。
++
++### 新增
++
++- **后台慢速错峰签到**：`POST /tasks/run` 默认改为异步任务，逐账号按 `10s + 0~5s` 随机抖动间隔执行，避免多账号批量签到触发风控；接口立即返回，不阻塞面板。传 `async: false` 保留旧的同步 1s 批跑路径，`interval` / `jitter` 可覆盖默认值。
++- **签到任务状态接口** `GET|POST /tasks/checkin-job`：返回 `state / total / done / ok / failed / current / results / logs`，供面板轮询进度。
++- **看板签到进度显示**：「每日签到」与福利中心「全部领取」按钮改为后台模式，按钮实时显示「签到中 50% · 账号名」，完成后自动刷新账号与积分。
++
++### 修复
++
++- **「禁用仍签到」勾选不持久化**：`Account` 类此前无 `checkin_when_disabled` 字段，`to_dict()` 不序列化、`public()` 不输出，导致看板勾选刷新即丢失且前端永远显示未勾选。现补入 `__init__` / `to_dict()` / `public()` 三处，落盘并回显。
++- **禁用账号仍被签到**：`task_daily_checkin` 增加显式判断，禁用账号默认跳过（`reason: account_disabled`），仅当勾选「禁用仍签到」时才继续；`_iter_accounts` 明确对显式传入的账号列表同样执行 `enabled` 过滤。
++- **import 导入账号伪 uid 导致 token 无法刷新**：`normalise_import_row` 在导入行缺 uid 时直接生成 `import-<sha256>` 伪 uid，导致刷新请求 `UserID` 与 refresh token 绑定的用户不一致（上游 `20101 refresh token user does not match`）。新增 `_uid_from_access_token()` 从 access token JWT 的 `data.id` 提取真实用户 ID，解析失败时静默回退伪 uid；显式 uid 优先级不变。
++
++### 运行注意
++
++- refresh token 为**轮换式**：每次 ExchangeToken 成功后旧 refresh token 立即失效。刷新务必走 `Account.refresh()` 封装（内部会调用 `sync_desktop_auth` 把新凭证写回桌面端），**禁止**直接调用 `trae_client.refresh_account()` 做验证，否则会作废桌面端凭证导致客户端掉线。
++- 相关环境变量：`TRAE_SYNC_DESKTOP`（默认 1 = 刷新后写回桌面端）、`TRAE_REFRESH_POLICY`（默认 `rotate` 主动刷新；`readonly` 只从桌面端读取）。
++- 回归：`python _test_trae.py` 基线 `PASS=240 FAIL=0 SKIP=0`。
++
+ ## [1.7.0] - 2026-11-18
+ 
+ ### 新增
+diff --git a/dashboard.html b/dashboard.html
+index e313a64..f58dc53 100644
+--- a/dashboard.html
++++ b/dashboard.html
+@@ -7116,17 +7116,47 @@ function checkinToastText(rows){
+ async function doCheckin(btn){
+   btn.disabled = true; const ot = btn.textContent; btn.textContent = "签到中...";
+   try {
+-    const r = await postJSON("/accounts/checkin", {});
+-    const res = r.results || [];
+-    if(!res.length) toast("未发现可签到账号", "warn");
+-    else {
+-      const rows = res.map(checkinOutcome);
+-      toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
++    // 后台慢速错峰签到（10s+0~5s 抖动），接口立即返回，轮询状态
++    const r = await postJSON("/tasks/run", {async:true});
++    if(!r || r.async){
++      const job = (r && r.job) || {state:"starting"};
++      toast((r && r.msg) || "后台签到任务已启动（10s+0~5s 错峰）", "ok");
++      // 轮询任务状态直到 done/idle
++      const t0 = Date.now();
++      const poll = setInterval(async () => {
++        try{
++          const s = await postJSON("/tasks/checkin-job", {});
++          const done = s.state === "done" || s.state === "idle";
++          const running = s.state === "running" || s.state === "starting";
++          if(!running && !done) return;
++          if(done){
++            clearInterval(poll);
++            btn.disabled = false; btn.textContent = ot;
++            const rows = (s.results || []).map(checkinOutcome);
++            if(!rows.length) toast("签到完成：无结果", "warn");
++            else toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
++            await initRealm(true);
++            await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
++          } else {
++            const cur = s.current || '';
++            const pct = s.total ? Math.round(s.done / s.total * 100) : 0;
++            btn.textContent = "签到中 " + pct + "%" + (cur ? " · " + cur : "");
++            if(Date.now() - t0 > 60000){ clearInterval(poll); btn.disabled=false; btn.textContent=ot; toast("签到仍在后台进行，可刷新查看", "warn"); }
++          }
++        }catch(e){ /* 轮询失败静默，下次再试 */ }
++      }, 1500);
++    } else {
++      const res = r.results || [];
++      if(!res.length) toast("未发现可签到账号", "warn");
++      else {
++        const rows = res.map(checkinOutcome);
++        toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
++      }
++      await initRealm(true);
++      await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
++      btn.disabled = false; btn.textContent = ot;
+     }
+-    await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
+-    await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
+-  }catch(e){ toast("签到失败: " + e.message, "bad"); }
+-  finally { btn.disabled = false; btn.textContent = ot; }
++  }catch(e){ toast("签到失败: " + e.message, "bad"); btn.disabled = false; btn.textContent = ot; }
+ }
+ 
+ 
+@@ -8406,7 +8436,30 @@ async function runGrowthTasks(btn){
+     if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
+       payload.uid = CURRENT_GROWTH_UID;
+     }
+-    const r = await postJSON("/tasks/run", payload);
++    const r = await postJSON("/tasks/run", {async:true});
++    if(r && r.async){
++      // 后台错峰签到：立即提示，轮询进度
++      toast((r.msg) || "后台签到已启动（10s+0~5s 错峰）", "ok");
++      if(logBox){
++        logBox.style.display = 'block';
++        logBox.innerHTML = '<div style="color:var(--accent)">' + esc(r.msg || '后台签到任务已启动') + '</div><div style="color:var(--dim)">任务在后台逐账号执行，完成后自动刷新...</div>';
++      }
++      const poll = setInterval(async () => {
++        try{
++          const s = await postJSON("/tasks/checkin-job", {});
++          if(s.state === "done" || s.state === "idle"){
++            clearInterval(poll);
++            const lines = (s.logs || []).slice(-15);
++            if(logBox) logBox.innerHTML = (lines.length ? lines : ['（无日志）']).map(l => '<div>' + esc(l) + '</div>').join('');
++            let sum = 0; (s.results || []).forEach(x => sum += (x.earned_credit || 0));
++            await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
++            toast("后台签到完成" + (sum ? '，新增 +' + sum + ' 积分' : '') + "！");
++            btn.disabled = false; btn.textContent = oldText;
++          }
++        }catch(e){}
++      }, 1500);
++      return;
++    }
+     const logs = (r.logs || []).slice();
+     let proMsg = '';
+     try{
+diff --git a/trae_accounts.py b/trae_accounts.py
+index a29859b..515d497 100644
+--- a/trae_accounts.py
++++ b/trae_accounts.py
+@@ -18,6 +18,7 @@
+   3. 只用标准库。
+ """
+ 
++import base64
+ import contextlib
+ import datetime
+ import hashlib
+@@ -1003,6 +1004,10 @@ class Account(object):
+                             if isinstance(data.get("entitlement"), dict) else None)
+         self.usage_updated_at = normalize_epoch(data.get("usage_updated_at"))
+         self.extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
++        # 禁用时仍签到（看板「设置」勾选；跟随 extra 落盘，读取兼容两种来源）
++        self.checkin_when_disabled = _truthy(
++            data.get("checkin_when_disabled",
++                     self.extra.get("checkin_when_disabled")), False)
+         # 账号级出口（落盘，空 = 走区域兜底 / 直连）
+         try:
+             self.proxy_own = normalize_proxy(data.get("proxy") or data.get("egress"))
+@@ -1049,6 +1054,7 @@ class Account(object):
+             "usage_updated_at": self.usage_updated_at,
+             "token_release_at": self.token_release_at,
+             "extra": self.extra,
++            "checkin_when_disabled": bool(getattr(self, "checkin_when_disabled", False)),
+         }
+ 
+     def to_desktop_dict(self):
+@@ -1705,6 +1711,7 @@ class Account(object):
+             "proxyConfigured": bool(self.proxy),
+             "proxySource": self.proxy_source,
+             "enabled": bool(self.enabled),
++            "checkinWhenDisabled": bool(getattr(self, "checkin_when_disabled", False)),
+             "status": self.status(now=now),
+             "weight": self.weight,
+             "disabledModels": list(self.disabled_models),
+@@ -2829,6 +2836,33 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
+     }
+ 
+ 
++def _uid_from_access_token(token):
++    """从 access token (JWT) 的 data.id 提取真实用户 ID。
++
++    导入行常常不带 uid；此时若用 import-<hash> 伪 uid，刷新请求的
++    UserID 会与 refresh token 绑定的用户不一致（上游 20101
++    "refresh token user does not match"）。因此优先从 token 里解出
++    真实 id；解析失败再退回伪 uid。失败必须静默（导入不能因坏 token 崩）。
++    """
++    try:
++        parts = str(token or "").split(".")
++        if len(parts) < 2:
++            return ""
++        payload = parts[1]
++        payload += "=" * (-len(payload) % 4)
++        info = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
++        data = info.get("data")
++        if isinstance(data, str):
++            data = json.loads(data)
++        if isinstance(data, dict):
++            uid = data.get("id") or data.get("uid") or data.get("user_id")
++            if uid not in (None, ""):
++                return str(uid)
++    except Exception:
++        pass
++    return ""
++
++
+ def _coerce_account_rows(blob):
+     """把任意受支持的容器规整成账号 dict 列表。返回 (rows, error)。"""
+     if isinstance(blob, list):
+@@ -2885,6 +2919,10 @@ def normalise_import_row(row, realm=None):
+                                 store_region=str(profile.get("storeRegion") or ""))
+     cfg = get_realm_config(detected)
+     uid = str(_first_present(row, "uid", "userId", "user_id", default="") or "").strip()
++    if not uid:
++        # 优先用 token 里的真实用户 ID，否则刷新时 UserID 与 refresh token
++        # 归属不匹配（上游 20101）；仅当 token 无法解析时才退回伪 uid。
++        uid = _uid_from_access_token(token)
+     if not uid:
+         uid = "import-" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:20]
+     expired_at = normalize_epoch(_first_present(row, "expired_at", "expiredAt",
+diff --git a/trae_proxy.py b/trae_proxy.py
+index 60ed0e3..7318c33 100644
+--- a/trae_proxy.py
++++ b/trae_proxy.py
+@@ -39,6 +39,7 @@ import re
+ import json
+ import os
+ MAX_PAYLOAD_BYTES = int(os.environ.get("TRAE_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
++import random
+ import ipaddress
+ import socket
+ import ssl
+@@ -7336,6 +7337,103 @@ def _queue_wait_seconds(detail):
+     except Exception:
+         return 30
+ CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
++
++# -- 后台慢速错峰签到（防多账号同时签到触发风控）-------------------------
++# 需求：账号多时「每日签到 / 刷新积分」做成后台任务，逐账号 10s + 0~5s
++# 随机抖动间隔执行，避免批量同时打上游。接口立刻返回，前端轮询状态。
++CHECKIN_JOB_LOCK = threading.RLock()
++CHECKIN_JOB_STATE = {
++    "state": "idle",        # idle | running | done
++    "started_at": 0, "finished_at": 0,
++    "total": 0, "done": 0, "ok": 0, "failed": 0, "skipped": 0,
++    "current": "",          # 当前正在处理的账号 label
++    "results": [],          # 每账号结果
++    "logs": [],             # 汇总日志
++    "error": "",
++    "interval": 10.0,       # 账号间基准间隔（秒）
++    "jitter": 5.0,          # 额外随机抖动（秒）
++}
++
++
++def checkin_job_state():
++    with CHECKIN_JOB_LOCK:
++        return json.loads(json.dumps(CHECKIN_JOB_STATE))
++
++
++def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
++    """后台线程：逐账号签到，间隔 interval + 0~jitter 随机，防风控。"""
++    import trae_tasks
++    _rng = rng or random
++    targets = [a for a in (targets or []) if a is not None]
++    with CHECKIN_JOB_LOCK:
++        CHECKIN_JOB_STATE.update({
++            "state": "running", "started_at": time.time(), "finished_at": 0,
++            "total": len(targets), "done": 0, "ok": 0, "failed": 0,
++            "skipped": 0, "current": "", "results": [], "logs": [], "error": "",
++            "interval": float(interval), "jitter": float(jitter),
++        })
++    last_at = None
++    for account in targets:
++        if account is None:
++            continue
++        label = account_label(account)
++        if not getattr(account, "enabled", True) or not getattr(account, "access_token", ""):
++            with CHECKIN_JOB_LOCK:
++                CHECKIN_JOB_STATE["done"] += 1
++                CHECKIN_JOB_STATE["skipped"] += 1
++                CHECKIN_JOB_STATE["results"].append(
++                    {"uid": getattr(account, "uid", ""), "ok": False,
++                     "skipped": True, "msg": "账号已禁用或缺少凭证", "logs": []})
++                CHECKIN_JOB_STATE["logs"].append("— [%s] 账号已禁用或缺少凭证，跳过" % label)
++            continue
++        # 防风控错峰：上次请求后至少等 interval + 0~jitter
++        if last_at is not None:
++            delay = float(interval) + float(_rng.uniform(0, jitter) if jitter > 0 else 0)
++            time.sleep(delay)
++        with CHECKIN_JOB_LOCK:
++            CHECKIN_JOB_STATE["current"] = label
++        try:
++            res = trae_tasks.run_checkin(account, gap=1.0, only_daily=True)
++            ok = bool(res.get("ok"))
++        except Exception as exc:
++            res = {"ok": False, "logs": [str(exc)[:200]]}
++            ok = False
++        finally:
++            last_at = time.time()
++        with CHECKIN_JOB_LOCK:
++            CHECKIN_JOB_STATE["done"] += 1
++            CHECKIN_JOB_STATE["ok" if ok else "failed"] += 1
++            CHECKIN_JOB_STATE["results"].append({
++                "uid": getattr(account, "uid", ""),
++                "ok": ok,
++                "earned_credit": res.get("earned_credit") or 0,
++                "msg": (res.get("logs") or [""])[-1],
++                "logs": res.get("logs") or [],
++                "credits": res.get("credits"),
++            })
++            CHECKIN_JOB_STATE["logs"].extend(
++                l for l in (res.get("logs") or []) if l.startswith(("✓", "!", "—")))
++    with CHECKIN_JOB_LOCK:
++        CHECKIN_JOB_STATE.update({
++            "state": "done", "finished_at": time.time(),
++            "current": "",
++        })
++    try:
++        trae_tasks.invalidate_panel_cache()
++    except Exception:
++        pass
++
++
++def start_checkin_job(targets, interval=10.0, jitter=5.0):
++    """启动后台慢速签到；已在运行则拒绝重复。返回 (started, state)。"""
++    with CHECKIN_JOB_LOCK:
++        if CHECKIN_JOB_STATE.get("state") == "running":
++            return False, checkin_job_state()
++        CHECKIN_JOB_STATE["state"] = "starting"
++    thread = threading.Thread(target=_run_checkin_job,
++                              args=(targets, interval, jitter), daemon=True)
++    thread.start()
++    return True, checkin_job_state()
+ _CLIENT_FAULT_MARKERS = (
+     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
+     "invalid_request_error",
+@@ -9925,6 +10023,8 @@ class Handler(BaseHTTPRequestHandler):
+             return self._i18n_pack(path[len("/i18n/"):])
+         if path == "/settings/model-context":
+             return self._json(200, {"model_context": trae_settings.model_context(ACCOUNTS_DIR)})
++        if path == "/tasks/checkin-job":
++            return self._json(200, checkin_job_state())
+         if path == "/usage/stats":
+             req_range, req_since, req_until = range_query(query)
+             return self._json(200, trae_stats.cached_usage_report("stats",
+@@ -10954,6 +11054,22 @@ class Handler(BaseHTTPRequestHandler):
+                            if a.enabled and a.access_token]
+             if not targets:
+                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
++            # 默认「后台慢速错峰」：逐账号 10s+0~5s 随机间隔执行，避免多账号
++            # 批量签到触发风控；接口立即返回，前端轮询 /tasks/checkin-job。
++            # 传 async=false 则退回旧的同步快速批跑（1s 间隔）。
++            async_mode = bool(payload.get("async", True))
++            if async_mode:
++                interval = float(payload.get("interval") or 10.0)
++                jitter = float(payload.get("jitter") if payload.get("jitter") is not None else 5.0)
++                started, state = start_checkin_job(targets, interval=interval, jitter=jitter)
++                return self._json(200, {
++                    "ok": True, "async": True, "started": started,
++                    "msg": ("后台签到任务已启动（间隔 %.0fs+0~%.0fs 抖动）"
++                            % (interval, jitter)) if started
++                           else "签到任务已在运行中，请稍候",
++                    "job": state,
++                    "accounts_count": len(targets),
++                })
+             res = trae_tasks.run_batch_checkin(targets, gap=1.0)
+             trae_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
+             return self._json(200, {
+@@ -10962,6 +11078,8 @@ class Handler(BaseHTTPRequestHandler):
+                 "logs": res["logs"],
+                 "accounts_count": res["accounts_count"],
+             })
++        if path == "/tasks/checkin-job":
++            return self._json(200, checkin_job_state())
+         if path == "/tasks/travel":
+             # 看板福利按钮的对应动作：批量领取 Pro 福利包（官方仅国内版 sash 活动）
+             import trae_tasks
+diff --git a/trae_tasks.py b/trae_tasks.py
+index 31cf6cc..4fc27bf 100644
+--- a/trae_tasks.py
++++ b/trae_tasks.py
+@@ -471,7 +471,11 @@ def _do_refresh(account):
+ 
+ 
+ def _iter_accounts(pool=None, accounts=None, realm=None, include_disabled=False):
+-    """统一账号遍历：显式 accounts 优先，其次 pool.accounts。"""
++    """统一账号遍历：显式 accounts 优先，其次 pool.accounts。
++
++    显式 accounts 列表同样执行 enabled 过滤（issue：手动 /tasks/run 曾对
++    禁用账号签到）。仅当 include_disabled=True（如到期提醒）才放行禁用账号。
++    """
+     if accounts is not None:
+         source = list(accounts)
+     elif pool is not None:
+@@ -1459,6 +1463,15 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
+             snapshot[uid] = {"ok": False, "skipped": True,
+                              "reason": "intl_no_checkin", "earned_credit": 0}
+             continue
++        # 禁用账号：默认跳过；仅当显式勾选「禁用仍签到」才继续
++        if not bool(getattr(account, "enabled", True)):
++            if not bool(getattr(account, "checkin_when_disabled", False)):
++                skipped += 1
++                logs.append("— [%s] 账号已禁用，跳过签到" % name)
++                snapshot[uid] = {"ok": False, "skipped": True,
++                                 "reason": "account_disabled", "earned_credit": 0}
++                continue
++            logs.append("… [%s] 账号已禁用，但勾选了「禁用仍签到」，继续" % name)
+         if calls_made:
+             delay = _pace(pacing, calls_made, waits)
+             paced_seconds += delay

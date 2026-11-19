@@ -1,3 +1,26 @@
+## [1.7.0-local.1] - 2026-11-19
+
+> **本地补丁版本（非上游）**：本条目记录本机自用时的改动，上游仓库不含这些提交。
+> 完整证据链、事故复盘与升级/回滚指引见 [docs/local-patches/LOCAL_PATCHES.md](docs/local-patches/LOCAL_PATCHES.md)。
+
+### 新增
+
+- **后台慢速错峰签到**：`POST /tasks/run` 默认改为异步任务，逐账号按 `10s + 0~5s` 随机抖动间隔执行，避免多账号批量签到触发风控；接口立即返回，不阻塞面板。传 `async: false` 保留旧的同步 1s 批跑路径，`interval` / `jitter` 可覆盖默认值。
+- **签到任务状态接口** `GET|POST /tasks/checkin-job`：返回 `state / total / done / ok / failed / current / results / logs`，供面板轮询进度。
+- **看板签到进度显示**：「每日签到」与福利中心「全部领取」按钮改为后台模式，按钮实时显示「签到中 50% · 账号名」，完成后自动刷新账号与积分。
+
+### 修复
+
+- **「禁用仍签到」勾选不持久化**：`Account` 类此前无 `checkin_when_disabled` 字段，`to_dict()` 不序列化、`public()` 不输出，导致看板勾选刷新即丢失且前端永远显示未勾选。现补入 `__init__` / `to_dict()` / `public()` 三处，落盘并回显。
+- **禁用账号仍被签到**：`task_daily_checkin` 增加显式判断，禁用账号默认跳过（`reason: account_disabled`），仅当勾选「禁用仍签到」时才继续；`_iter_accounts` 明确对显式传入的账号列表同样执行 `enabled` 过滤。
+- **import 导入账号伪 uid 导致 token 无法刷新**：`normalise_import_row` 在导入行缺 uid 时直接生成 `import-<sha256>` 伪 uid，导致刷新请求 `UserID` 与 refresh token 绑定的用户不一致（上游 `20101 refresh token user does not match`）。新增 `_uid_from_access_token()` 从 access token JWT 的 `data.id` 提取真实用户 ID，解析失败时静默回退伪 uid；显式 uid 优先级不变。
+
+### 运行注意
+
+- refresh token 为**轮换式**：每次 ExchangeToken 成功后旧 refresh token 立即失效。刷新务必走 `Account.refresh()` 封装（内部会调用 `sync_desktop_auth` 把新凭证写回桌面端），**禁止**直接调用 `trae_client.refresh_account()` 做验证，否则会作废桌面端凭证导致客户端掉线。
+- 相关环境变量：`TRAE_SYNC_DESKTOP`（默认 1 = 刷新后写回桌面端）、`TRAE_REFRESH_POLICY`（默认 `rotate` 主动刷新；`readonly` 只从桌面端读取）。
+- 回归：`python _test_trae.py` 基线 `PASS=240 FAIL=0 SKIP=0`。
+
 ## [1.7.0] - 2026-11-18
 
 ### 新增

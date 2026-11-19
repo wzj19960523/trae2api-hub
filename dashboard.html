@@ -7116,17 +7116,47 @@ function checkinToastText(rows){
 async function doCheckin(btn){
   btn.disabled = true; const ot = btn.textContent; btn.textContent = "签到中...";
   try {
-    const r = await postJSON("/accounts/checkin", {});
-    const res = r.results || [];
-    if(!res.length) toast("未发现可签到账号", "warn");
-    else {
-      const rows = res.map(checkinOutcome);
-      toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
+    // 后台慢速错峰签到（10s+0~5s 抖动），接口立即返回，轮询状态
+    const r = await postJSON("/tasks/run", {async:true});
+    if(!r || r.async){
+      const job = (r && r.job) || {state:"starting"};
+      toast((r && r.msg) || "后台签到任务已启动（10s+0~5s 错峰）", "ok");
+      // 轮询任务状态直到 done/idle
+      const t0 = Date.now();
+      const poll = setInterval(async () => {
+        try{
+          const s = await postJSON("/tasks/checkin-job", {});
+          const done = s.state === "done" || s.state === "idle";
+          const running = s.state === "running" || s.state === "starting";
+          if(!running && !done) return;
+          if(done){
+            clearInterval(poll);
+            btn.disabled = false; btn.textContent = ot;
+            const rows = (s.results || []).map(checkinOutcome);
+            if(!rows.length) toast("签到完成：无结果", "warn");
+            else toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
+            await initRealm(true);
+            await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
+          } else {
+            const cur = s.current || '';
+            const pct = s.total ? Math.round(s.done / s.total * 100) : 0;
+            btn.textContent = "签到中 " + pct + "%" + (cur ? " · " + cur : "");
+            if(Date.now() - t0 > 60000){ clearInterval(poll); btn.disabled=false; btn.textContent=ot; toast("签到仍在后台进行，可刷新查看", "warn"); }
+          }
+        }catch(e){ /* 轮询失败静默，下次再试 */ }
+      }, 1500);
+    } else {
+      const res = r.results || [];
+      if(!res.length) toast("未发现可签到账号", "warn");
+      else {
+        const rows = res.map(checkinOutcome);
+        toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
+      }
+      await initRealm(true);
+      await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
+      btn.disabled = false; btn.textContent = ot;
     }
-    await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
-    await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
-  }catch(e){ toast("签到失败: " + e.message, "bad"); }
-  finally { btn.disabled = false; btn.textContent = ot; }
+  }catch(e){ toast("签到失败: " + e.message, "bad"); btn.disabled = false; btn.textContent = ot; }
 }
 
 
@@ -8406,7 +8436,30 @@ async function runGrowthTasks(btn){
     if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
       payload.uid = CURRENT_GROWTH_UID;
     }
-    const r = await postJSON("/tasks/run", payload);
+    const r = await postJSON("/tasks/run", {async:true});
+    if(r && r.async){
+      // 后台错峰签到：立即提示，轮询进度
+      toast((r.msg) || "后台签到已启动（10s+0~5s 错峰）", "ok");
+      if(logBox){
+        logBox.style.display = 'block';
+        logBox.innerHTML = '<div style="color:var(--accent)">' + esc(r.msg || '后台签到任务已启动') + '</div><div style="color:var(--dim)">任务在后台逐账号执行，完成后自动刷新...</div>';
+      }
+      const poll = setInterval(async () => {
+        try{
+          const s = await postJSON("/tasks/checkin-job", {});
+          if(s.state === "done" || s.state === "idle"){
+            clearInterval(poll);
+            const lines = (s.logs || []).slice(-15);
+            if(logBox) logBox.innerHTML = (lines.length ? lines : ['（无日志）']).map(l => '<div>' + esc(l) + '</div>').join('');
+            let sum = 0; (s.results || []).forEach(x => sum += (x.earned_credit || 0));
+            await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
+            toast("后台签到完成" + (sum ? '，新增 +' + sum + ' 积分' : '') + "！");
+            btn.disabled = false; btn.textContent = oldText;
+          }
+        }catch(e){}
+      }, 1500);
+      return;
+    }
     const logs = (r.logs || []).slice();
     let proMsg = '';
     try{

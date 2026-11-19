@@ -39,6 +39,7 @@ import re
 import json
 import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("TRAE_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
+import random
 import ipaddress
 import socket
 import ssl
@@ -7336,6 +7337,103 @@ def _queue_wait_seconds(detail):
     except Exception:
         return 30
 CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
+
+# -- 后台慢速错峰签到（防多账号同时签到触发风控）-------------------------
+# 需求：账号多时「每日签到 / 刷新积分」做成后台任务，逐账号 10s + 0~5s
+# 随机抖动间隔执行，避免批量同时打上游。接口立刻返回，前端轮询状态。
+CHECKIN_JOB_LOCK = threading.RLock()
+CHECKIN_JOB_STATE = {
+    "state": "idle",        # idle | running | done
+    "started_at": 0, "finished_at": 0,
+    "total": 0, "done": 0, "ok": 0, "failed": 0, "skipped": 0,
+    "current": "",          # 当前正在处理的账号 label
+    "results": [],          # 每账号结果
+    "logs": [],             # 汇总日志
+    "error": "",
+    "interval": 10.0,       # 账号间基准间隔（秒）
+    "jitter": 5.0,          # 额外随机抖动（秒）
+}
+
+
+def checkin_job_state():
+    with CHECKIN_JOB_LOCK:
+        return json.loads(json.dumps(CHECKIN_JOB_STATE))
+
+
+def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
+    """后台线程：逐账号签到，间隔 interval + 0~jitter 随机，防风控。"""
+    import trae_tasks
+    _rng = rng or random
+    targets = [a for a in (targets or []) if a is not None]
+    with CHECKIN_JOB_LOCK:
+        CHECKIN_JOB_STATE.update({
+            "state": "running", "started_at": time.time(), "finished_at": 0,
+            "total": len(targets), "done": 0, "ok": 0, "failed": 0,
+            "skipped": 0, "current": "", "results": [], "logs": [], "error": "",
+            "interval": float(interval), "jitter": float(jitter),
+        })
+    last_at = None
+    for account in targets:
+        if account is None:
+            continue
+        label = account_label(account)
+        if not getattr(account, "enabled", True) or not getattr(account, "access_token", ""):
+            with CHECKIN_JOB_LOCK:
+                CHECKIN_JOB_STATE["done"] += 1
+                CHECKIN_JOB_STATE["skipped"] += 1
+                CHECKIN_JOB_STATE["results"].append(
+                    {"uid": getattr(account, "uid", ""), "ok": False,
+                     "skipped": True, "msg": "账号已禁用或缺少凭证", "logs": []})
+                CHECKIN_JOB_STATE["logs"].append("— [%s] 账号已禁用或缺少凭证，跳过" % label)
+            continue
+        # 防风控错峰：上次请求后至少等 interval + 0~jitter
+        if last_at is not None:
+            delay = float(interval) + float(_rng.uniform(0, jitter) if jitter > 0 else 0)
+            time.sleep(delay)
+        with CHECKIN_JOB_LOCK:
+            CHECKIN_JOB_STATE["current"] = label
+        try:
+            res = trae_tasks.run_checkin(account, gap=1.0, only_daily=True)
+            ok = bool(res.get("ok"))
+        except Exception as exc:
+            res = {"ok": False, "logs": [str(exc)[:200]]}
+            ok = False
+        finally:
+            last_at = time.time()
+        with CHECKIN_JOB_LOCK:
+            CHECKIN_JOB_STATE["done"] += 1
+            CHECKIN_JOB_STATE["ok" if ok else "failed"] += 1
+            CHECKIN_JOB_STATE["results"].append({
+                "uid": getattr(account, "uid", ""),
+                "ok": ok,
+                "earned_credit": res.get("earned_credit") or 0,
+                "msg": (res.get("logs") or [""])[-1],
+                "logs": res.get("logs") or [],
+                "credits": res.get("credits"),
+            })
+            CHECKIN_JOB_STATE["logs"].extend(
+                l for l in (res.get("logs") or []) if l.startswith(("✓", "!", "—")))
+    with CHECKIN_JOB_LOCK:
+        CHECKIN_JOB_STATE.update({
+            "state": "done", "finished_at": time.time(),
+            "current": "",
+        })
+    try:
+        trae_tasks.invalidate_panel_cache()
+    except Exception:
+        pass
+
+
+def start_checkin_job(targets, interval=10.0, jitter=5.0):
+    """启动后台慢速签到；已在运行则拒绝重复。返回 (started, state)。"""
+    with CHECKIN_JOB_LOCK:
+        if CHECKIN_JOB_STATE.get("state") == "running":
+            return False, checkin_job_state()
+        CHECKIN_JOB_STATE["state"] = "starting"
+    thread = threading.Thread(target=_run_checkin_job,
+                              args=(targets, interval, jitter), daemon=True)
+    thread.start()
+    return True, checkin_job_state()
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
     "invalid_request_error",
@@ -9925,6 +10023,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._i18n_pack(path[len("/i18n/"):])
         if path == "/settings/model-context":
             return self._json(200, {"model_context": trae_settings.model_context(ACCOUNTS_DIR)})
+        if path == "/tasks/checkin-job":
+            return self._json(200, checkin_job_state())
         if path == "/usage/stats":
             req_range, req_since, req_until = range_query(query)
             return self._json(200, trae_stats.cached_usage_report("stats",
@@ -10954,6 +11054,22 @@ class Handler(BaseHTTPRequestHandler):
                            if a.enabled and a.access_token]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
+            # 默认「后台慢速错峰」：逐账号 10s+0~5s 随机间隔执行，避免多账号
+            # 批量签到触发风控；接口立即返回，前端轮询 /tasks/checkin-job。
+            # 传 async=false 则退回旧的同步快速批跑（1s 间隔）。
+            async_mode = bool(payload.get("async", True))
+            if async_mode:
+                interval = float(payload.get("interval") or 10.0)
+                jitter = float(payload.get("jitter") if payload.get("jitter") is not None else 5.0)
+                started, state = start_checkin_job(targets, interval=interval, jitter=jitter)
+                return self._json(200, {
+                    "ok": True, "async": True, "started": started,
+                    "msg": ("后台签到任务已启动（间隔 %.0fs+0~%.0fs 抖动）"
+                            % (interval, jitter)) if started
+                           else "签到任务已在运行中，请稍候",
+                    "job": state,
+                    "accounts_count": len(targets),
+                })
             res = trae_tasks.run_batch_checkin(targets, gap=1.0)
             trae_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {
@@ -10962,6 +11078,8 @@ class Handler(BaseHTTPRequestHandler):
                 "logs": res["logs"],
                 "accounts_count": res["accounts_count"],
             })
+        if path == "/tasks/checkin-job":
+            return self._json(200, checkin_job_state())
         if path == "/tasks/travel":
             # 看板福利按钮的对应动作：批量领取 Pro 福利包（官方仅国内版 sash 活动）
             import trae_tasks

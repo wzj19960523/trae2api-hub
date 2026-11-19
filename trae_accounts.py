@@ -18,6 +18,7 @@
   3. 只用标准库。
 """
 
+import base64
 import contextlib
 import datetime
 import hashlib
@@ -1003,6 +1004,10 @@ class Account(object):
                             if isinstance(data.get("entitlement"), dict) else None)
         self.usage_updated_at = normalize_epoch(data.get("usage_updated_at"))
         self.extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
+        # 禁用时仍签到（看板「设置」勾选；跟随 extra 落盘，读取兼容两种来源）
+        self.checkin_when_disabled = _truthy(
+            data.get("checkin_when_disabled",
+                     self.extra.get("checkin_when_disabled")), False)
         # 账号级出口（落盘，空 = 走区域兜底 / 直连）
         try:
             self.proxy_own = normalize_proxy(data.get("proxy") or data.get("egress"))
@@ -1049,6 +1054,7 @@ class Account(object):
             "usage_updated_at": self.usage_updated_at,
             "token_release_at": self.token_release_at,
             "extra": self.extra,
+            "checkin_when_disabled": bool(getattr(self, "checkin_when_disabled", False)),
         }
 
     def to_desktop_dict(self):
@@ -1705,6 +1711,7 @@ class Account(object):
             "proxyConfigured": bool(self.proxy),
             "proxySource": self.proxy_source,
             "enabled": bool(self.enabled),
+            "checkinWhenDisabled": bool(getattr(self, "checkin_when_disabled", False)),
             "status": self.status(now=now),
             "weight": self.weight,
             "disabledModels": list(self.disabled_models),
@@ -2829,6 +2836,33 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
     }
 
 
+def _uid_from_access_token(token):
+    """从 access token (JWT) 的 data.id 提取真实用户 ID。
+
+    导入行常常不带 uid；此时若用 import-<hash> 伪 uid，刷新请求的
+    UserID 会与 refresh token 绑定的用户不一致（上游 20101
+    "refresh token user does not match"）。因此优先从 token 里解出
+    真实 id；解析失败再退回伪 uid。失败必须静默（导入不能因坏 token 崩）。
+    """
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return ""
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        info = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        data = info.get("data")
+        if isinstance(data, str):
+            data = json.loads(data)
+        if isinstance(data, dict):
+            uid = data.get("id") or data.get("uid") or data.get("user_id")
+            if uid not in (None, ""):
+                return str(uid)
+    except Exception:
+        pass
+    return ""
+
+
 def _coerce_account_rows(blob):
     """把任意受支持的容器规整成账号 dict 列表。返回 (rows, error)。"""
     if isinstance(blob, list):
@@ -2885,6 +2919,10 @@ def normalise_import_row(row, realm=None):
                                 store_region=str(profile.get("storeRegion") or ""))
     cfg = get_realm_config(detected)
     uid = str(_first_present(row, "uid", "userId", "user_id", default="") or "").strip()
+    if not uid:
+        # 优先用 token 里的真实用户 ID，否则刷新时 UserID 与 refresh token
+        # 归属不匹配（上游 20101）；仅当 token 无法解析时才退回伪 uid。
+        uid = _uid_from_access_token(token)
     if not uid:
         uid = "import-" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:20]
     expired_at = normalize_epoch(_first_present(row, "expired_at", "expiredAt",
