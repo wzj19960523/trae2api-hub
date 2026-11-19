@@ -1,3 +1,23 @@
+## [1.7.0-local.4] - 2026-11-19
+
+> 本地补丁版本（非上游）。修复签到偶发显示「签到未生效：success」。
+
+### 修复
+
+- **签到状态误判**：`claim_checkin` 在 claim 返回 `code=0/success` 后**立即**查询状态，上游状态写入有延迟时仍读到 `checked_in=false`，于是把成功判成失败；更糟的是失败分支把 status 的 `message`（`"success"`）当原因展示，出现「签到未生效：success」这种自相矛盾的提示。
+  现改为：claim 已受理但状态未刷新时，按 `CHECKIN_STATUS_RETRY=2` 次、间隔 1 秒重试查询；仍刷新不出则提示「上游已受理签到但状态尚未刷新」而不是报失败。返回值新增 `status_retries` 便于排查。业务错误码（如活动已结束）不重试，直接透传上游原因。
+
+### 排查记录
+
+- 失败账号 `2468861743727900`（富安娜春风店）的 `checkin_status` 返回 `checked_in=false / credits=100 / message=success`，手动 `claim_checkin` 立刻成功 → 判定为瞬时问题，非账号异常（该账号 OAuth、`cn`、entitlement 无错误）。
+- 与同日 `SSL: UNEXPECTED_EOF_WHILE_READING` 故障同属上游晚间不稳定时段。
+
+### 验证
+
+- 打桩：状态延迟场景 `ok=True, status_retries=1`；业务错误场景 `ok=False, status_retries=0`
+- 实跑 4 账号 `4/4 ok=True`，该账号 `extra.checkin` 修正为 `checked_in: true`
+- `_test_trae.py`：`PASS=240 FAIL=0`
+
 ## [1.7.0-local.3] - 2026-11-19
 
 > 本地补丁版本（非上游）。修复客户端反复报 `Trae SOLO upstream failed: ... SSL: UNEXPECTED_EOF_WHILE_READING ... (502) (4028)`。

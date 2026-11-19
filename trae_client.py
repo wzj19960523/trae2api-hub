@@ -1323,6 +1323,12 @@ def fetch_entitlement(account, realm=None, strict=False, timeout=45):
 PATH_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
 PATH_CHECKIN_CLAIM = "/trae/api/v2/ug/checkin_credits/claim"
 
+# claim 受理后状态写入有延迟：立即查询可能仍为 checked_in=false（且 message 仍是
+# "success"）。此时按「失败」判定会产生「签到未生效：success」的自相矛盾提示。
+# 对「已受理但未刷新」重试查询 CHECKIN_STATUS_RETRY 次、每次间隔 _GAP 秒。
+CHECKIN_STATUS_RETRY = 2
+CHECKIN_STATUS_RETRY_GAP = 1.0
+
 
 def _checkin_req_source(realm):
     """客户端：国内版 1、国际版 2（main.js li(this.P)?2:1）。"""
@@ -1370,17 +1376,39 @@ def claim_checkin(account, realm=None, timeout=30):
     raw = request_json(account, realm, PATH_CHECKIN_CLAIM, body, base="ug",
                        timeout=timeout)
     after = checkin_status(account, realm, timeout=timeout)
+    # 上游状态写入有延迟：claim 返回 code=0/success 后立刻查询，checked_in 仍可能是
+    # false。此时状态里 message 也是 "success"，直接判定会得到
+    # 「签到未生效：success」这种自相矛盾的结果。这里对「claim 已受理但状态未刷新」
+    # 重试查询 1~2 次（1s 间隔），避免把成功误判为失败。
+    retries = 0
+    claim_ok = (not isinstance(raw, dict)
+                or raw.get("code") in (0, None))
+    while (claim_ok and not after.get("checked_in")
+           and retries < CHECKIN_STATUS_RETRY):
+        retries += 1
+        time.sleep(CHECKIN_STATUS_RETRY_GAP)
+        try:
+            after = checkin_status(account, realm, timeout=timeout)
+        except Exception:
+            break
     before_credits = int(before.get("credits") or 0)
     after_credits = int(after.get("credits") or 0)
     earned = max(0, after_credits - before_credits)
-    ok = bool(after.get("checked_in")) and (not isinstance(raw, dict)
-                                            or raw.get("code") in (0, None))
+    ok = bool(after.get("checked_in")) and claim_ok
+    if ok:
+        message = "签到成功（积分 %s）" % after_credits
+    elif claim_ok:
+        # 上游已受理但状态未刷新：不是失败，别让用户以为要重试
+        message = ("上游已受理签到但状态尚未刷新（已重试 %d 次），"
+                   "请稍后刷新查看；本账号积分 %s" % (retries, after_credits))
+    else:
+        message = (after.get("message") or (raw or {}).get("message")
+                   or "签到未生效")
     return {"ok": ok, "checked_in": bool(after.get("checked_in")),
             "already": False, "credits": after_credits,
             "earned_credit": earned,
-            "message": (("签到成功（积分 %s）" % after_credits) if ok
-                        else (after.get("message") or (raw or {}).get("message")
-                              or "签到未生效")),
+            "message": message,
+            "status_retries": retries,
             "raw": {"claim": raw, "status": after}}
 
 

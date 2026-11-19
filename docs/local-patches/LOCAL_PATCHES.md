@@ -78,6 +78,7 @@
 | 5 | 已签到账号仍会发一次状态查询 | 多一次请求 = 多一分风控面 | `trae_proxy.py` | 优化：本地记录命中则 0 请求跳过 |
 | 6 | 网关进程无守护，会话结束即停 | 需手动启动、无崩溃自愈 | `service-start.bat` + 计划任务 | 运维：登录自启 + 失败重启 |
 | 7 | SOLO 路径遇 TLS 抖动（SSL EOF）一次即失败 | 上游偶发断连直接报 502/4028 给客户端 | `trae_proxy.py` | 稳定性：补传输层重试（1s/2s 退避） |
+| 8 | 签到成功后状态查询过早，被误判为失败 | 看板显示「签到未生效：success」自相矛盾 | `trae_client.py` | 修复：状态未刷新时重试查询 |
 
 代码改动统计：`trae_accounts.py` +33 行，`trae_tasks.py` +15/-1 行（共 52 插入、1 删除）。
 
@@ -229,6 +230,56 @@ for attempt in range(TRANSIENT_MAX_RETRIES + 1):
 
 **验证**：`_is_transient_transport` 对 `URLError(SSLError(...))` 与裸 `SSLError` 均返回 `True`；
 `_test_trae.py` 240 项通过；重启后 `DeepSeek-V4-Flash` 1766ms、`MiMo-V2.6-Flash` 1156ms 均正常返回。
+
+### 1.4 Patch 8：「签到未生效：success」误判
+
+**现象**：看板第四个账号显示 `! [富安娜春风店] 签到未生效：success` —— 上游明确回了 `success`，
+却被判为失败，文案自相矛盾。
+
+**排查**（只读）：
+
+```json
+// checkin_status 原始返回：今天确实未签到
+{"checked_in": false, "code": 0, "credits": 100,
+ "did_checked_in": false, "enable": true, "extra_credits": 100, "message": "success"}
+```
+
+手动执行 `claim_checkin` 立刻成功（`ok=True, checked_in=True`），说明账号本身没问题，
+**失败是瞬时的**。再看代码：
+
+```python
+raw = request_json(...)                    # claim → {"code":0,"message":"success"}
+after = checkin_status(...)                # ← 立刻查，上游状态可能还没写入
+ok = bool(after.get("checked_in")) and (raw.get("code") in (0, None))
+message = ... if ok else (after.get("message") ...)   # 失败时取到 "success"
+```
+
+三个问题叠加：① claim 后**没有任何等待/重试**就查状态；② 上游状态写入有延迟；
+③ 失败分支的 message 直接取 status 的 `message`（`"success"`）→ 出现「签到未生效：success」。
+
+**修复**（`trae_client.claim_checkin`）：
+
+```python
+CHECKIN_STATUS_RETRY = 2          # 重试次数
+CHECKIN_STATUS_RETRY_GAP = 1.0    # 每次间隔（秒）
+
+retries = 0
+while (claim_ok and not after.get("checked_in") and retries < CHECKIN_STATUS_RETRY):
+    retries += 1
+    time.sleep(CHECKIN_STATUS_RETRY_GAP)
+    after = checkin_status(...)
+```
+
+同时改写失败文案：`claim_ok` 为真但状态未刷新时，提示
+「上游已受理签到但状态尚未刷新（已重试 N 次），请稍后刷新查看」——不再出现自相矛盾的 success。
+返回值新增 `status_retries` 字段便于排查。
+
+**验证**：
+
+- 打桩场景 1（状态延迟 2 次后刷新）：`ok=True, status_retries=1` → 不再误判
+- 打桩场景 2（claim 返回业务码 40001）：`ok=False, status_retries=0` → 业务错误不重试，直接透传原因
+- 实跑 4 账号：`4/4 ok=True`，第四个账号显示「今日已签到（积分 100）」，`extra.checkin.checked_in` 修正为 `true`
+- `_test_trae.py`：`PASS=240 FAIL=0`
 
 ---
 
