@@ -7360,16 +7360,21 @@ def checkin_job_state():
         return json.loads(json.dumps(CHECKIN_JOB_STATE))
 
 
-def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
+def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None, force=False):
     """后台线程：逐账号签到，间隔 interval + 0~jitter 随机，防风控。
 
     整体包 try/finally：任何未预料的异常（账号对象异常、随机数失败等）都必须
     把 state 从 running 落回 done，否则 start_checkin_job 会永久拒绝新任务
     （状态卡 running = 功能失效直到重启网关）。
+
+    force=False（默认）时先用账号文件里的 extra.checkin 判断「今天是否已签到」，
+    已签的直接跳过、**不发任何请求**（比 claim_checkin 的先查后领更省，风控面最小）。
     """
     import trae_tasks
+    import trae_activity
     _rng = rng or random
     targets = [a for a in (targets or []) if a is not None]
+    today = time.strftime("%Y-%m-%d")
     with CHECKIN_JOB_LOCK:
         CHECKIN_JOB_STATE.update({
             "state": "running", "started_at": time.time(), "finished_at": 0,
@@ -7391,6 +7396,29 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
                         {"uid": getattr(account, "uid", ""), "ok": False,
                          "skipped": True, "msg": "账号已禁用或缺少凭证", "logs": []})
                     CHECKIN_JOB_STATE["logs"].append("— [%s] 账号已禁用或缺少凭证，跳过" % label)
+                continue
+            # 本地「今日已签到」判断：命中则 0 请求直接跳过
+            ck = (getattr(account, "extra", {}) or {}).get("checkin") or {}
+            if (not force and str(ck.get("at") or "").startswith(today)
+                    and bool(ck.get("checked_in"))):
+                with CHECKIN_JOB_LOCK:
+                    CHECKIN_JOB_STATE["done"] += 1
+                    CHECKIN_JOB_STATE["skipped"] += 1
+                    CHECKIN_JOB_STATE["results"].append(
+                        {"uid": getattr(account, "uid", ""), "ok": True,
+                         "skipped": True, "earned_credit": 0,
+                         "msg": "今日已签到（本地记录 %s），跳过请求" % ck.get("at"),
+                         "logs": [], "credits": {"remain": ck.get("credits")}})
+                    CHECKIN_JOB_STATE["logs"].append(
+                        "— [%s] 今日已签到（本地记录），跳过请求" % label)
+                try:
+                    trae_activity.record(
+                        USAGE_DIR, "checkin", True,
+                        uid=getattr(account, "uid", ""), nickname=label,
+                        realm=getattr(account, "realm", ""),
+                        detail="今日已签到（本地记录跳过）", amount=0)
+                except Exception:
+                    pass
                 continue
             # 防风控错峰：上次请求后至少等 interval + 0~jitter
             if last_at is not None:
@@ -7419,6 +7447,31 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
                 })
                 CHECKIN_JOB_STATE["logs"].extend(
                     l for l in (res.get("logs") or []) if l.startswith(("✓", "!", "—")))
+            # 落盘 1/2：账号文件里的今日签到记录（供下次「本地已签跳过」判断，
+            # 也让看板账号行显示签到状态）。失败不影响主流程。
+            try:
+                account.extra = dict(getattr(account, "extra", {}) or {})
+                account.extra["checkin"] = {
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "checked_in": bool(ok),
+                    "credits": (res.get("credits") or {}).get("remain")
+                    if isinstance(res.get("credits"), dict) else res.get("credits"),
+                    "earned_credit": int(res.get("earned_credit") or 0),
+                }
+                if hasattr(account, "save"):
+                    account.save(ACCOUNTS_DIR)
+            except Exception:
+                pass
+            # 落盘 2/2：usage/activity.jsonl 流水（看板「积分获取历史」读它）
+            try:
+                trae_activity.record(
+                    USAGE_DIR, "checkin", ok,
+                    uid=getattr(account, "uid", ""), nickname=label,
+                    realm=getattr(account, "realm", ""),
+                    detail=(res.get("logs") or [""])[-1],
+                    amount=int(res.get("earned_credit") or 0))
+            except Exception:
+                pass
     except Exception as exc:                                   # noqa: BLE001
         with CHECKIN_JOB_LOCK:
             CHECKIN_JOB_STATE["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
@@ -7434,14 +7487,18 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
             pass
 
 
-def start_checkin_job(targets, interval=10.0, jitter=5.0):
-    """启动后台慢速签到；已在运行则拒绝重复。返回 (started, state)。"""
+def start_checkin_job(targets, interval=10.0, jitter=5.0, force=False):
+    """启动后台慢速签到；已在运行则拒绝重复。返回 (started, state)。
+
+    force=True 表示忽略本地「今日已签」记录，强制重新查询/领取。
+    """
     with CHECKIN_JOB_LOCK:
         if CHECKIN_JOB_STATE.get("state") == "running":
             return False, checkin_job_state()
         CHECKIN_JOB_STATE["state"] = "starting"
     thread = threading.Thread(target=_run_checkin_job,
-                              args=(targets, interval, jitter), daemon=True)
+                              args=(targets, interval, jitter, None, force),
+                              daemon=True)
     thread.start()
     return True, checkin_job_state()
 _CLIENT_FAULT_MARKERS = (
@@ -11071,7 +11128,9 @@ class Handler(BaseHTTPRequestHandler):
             if async_mode:
                 interval = float(payload.get("interval") or 10.0)
                 jitter = float(payload.get("jitter") if payload.get("jitter") is not None else 5.0)
-                started, state = start_checkin_job(targets, interval=interval, jitter=jitter)
+                started, state = start_checkin_job(
+                    targets, interval=interval, jitter=jitter,
+                    force=bool(payload.get("force")))
                 return self._json(200, {
                     "ok": True, "async": True, "started": started,
                     "msg": ("后台签到任务已启动（间隔 %.0fs+0~%.0fs 抖动）"

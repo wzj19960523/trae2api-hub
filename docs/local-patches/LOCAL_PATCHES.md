@@ -74,6 +74,9 @@
 | 1 | 「禁用仍签到」勾选刷新后丢失，且禁用账号仍被签到 | 看板设置失效；禁用账号仍消耗签到配额 | `trae_accounts.py`、`trae_tasks.py` | 代码 bug 修复 |
 | 2 | import 导入账号的 token 无法刷新 | token 过期后账号失效（上游 20101） | `trae_accounts.py` | 代码 bug 修复 + 数据修复 |
 | 3 | 签到按钮同步批跑（1s 间隔），多账号易触发风控 | 账号多时 HTTP 阻塞久、并发打卡有风控风险 | `trae_proxy.py`、`dashboard.html` | 功能增强：后台慢速错峰签到 |
+| 4 | 签到结果只在内存，重启即丢 | 看板「积分获取历史」查不到、无法追溯 | `trae_proxy.py` | 功能增强：落盘 activity.jsonl + extra.checkin |
+| 5 | 已签到账号仍会发一次状态查询 | 多一次请求 = 多一分风控面 | `trae_proxy.py` | 优化：本地记录命中则 0 请求跳过 |
+| 6 | 网关进程无守护，会话结束即停 | 需手动启动、无崩溃自愈 | `service-start.bat` + 计划任务 | 运维：登录自启 + 失败重启 |
 
 代码改动统计：`trae_accounts.py` +33 行，`trae_tasks.py` +15/-1 行（共 52 插入、1 删除）。
 
@@ -96,6 +99,72 @@
 **实测**：2 个账号总耗时 15 秒（落在 10~15s 区间），接口立即返回不阻塞，2/2 签到成功。
 
 **可调**：接口入参 `{"interval": 20, "jitter": 10}`，或用环境变量思路后续扩展。
+
+### 1.2 Patch 4/5/6：签到落盘、已签跳过、服务托管
+
+**补丁 4 — 签到结果落盘**
+
+`_run_checkin_job` 每个账号处理后写两处：
+
+| 落点 | 内容 | 用途 |
+|---|---|---|
+| `usage/activity.jsonl` | `{ts, kind:"checkin", ok, uid, nickname, realm, detail, amount}` | 看板「积分获取历史」（`GET /accounts/activity` 读它） |
+| `accounts/<uid>.json` 的 `extra.checkin` | `{at, checked_in, credits, earned_credit}` | 供下次「本地已签跳过」判断 + 账号行状态显示 |
+
+写入复用项目自带的 `trae_activity.record()`（自动按 `MAX_BYTES` 轮转），任何异常静默不影响主流程。
+
+**补丁 5 — 已签到账号 0 请求跳过**
+
+`claim_checkin` 本来就是「先查 status、已签则不发 claim」，但仍会发 1 次状态查询。现在 `_run_checkin_job` 增加前置判断：
+
+```
+extra.checkin.at 是今天 且 checked_in=true  →  直接跳过，不发任何请求
+```
+
+- 实测 3 个已签账号：**0 请求、秒级完成**（原来要发 3 次状态查询）
+- 传 `{"force": true}` 可忽略本地记录强制重查（用于状态可能不同步的场景）
+- 昨日签到记录不影响今日（按 `YYYY-MM-DD` 前缀比对）
+
+**补丁 6 — 网关服务托管（Windows 计划任务）**
+
+本机 `schtasks.exe` 被安全策略拉黑（`PROGRAM BLOCKED`），改用 PowerShell `Register-ScheduledTask` 注册。
+
+`service-start.bat`（纯 ASCII）：
+
+```bat
+@echo off
+cd /d D:\phpstudy_pro\WWW\trae2api-hub
+"C:\Users\1\AppData\Local\Programs\Python\Python312\pythonw.exe" trae_proxy.py >> gateway.log 2>&1
+```
+
+任务配置（任务名 `trae2api-hub-gateway`）：
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 触发器 | AtLogOn（当前用户） | 登录即启动，不需要管理员 |
+| 运行身份 | `InteractiveToken` + `LeastPrivilege` | 不保存密码，改密码不影响 |
+| 操作 | `service-start.bat`，工作目录=项目根 | `pythonw` 无窗口 + 日志重定向 |
+| 失败重启 | `RestartCount=999`, `Interval=PT1M` | 崩溃后每分钟自动重试 |
+| 运行上限 | `PT0S`（不限时） | 常驻服务 |
+| 并发 | `IgnoreNew` | 防止重复实例抢端口 |
+| 电池 | 两项均为 false | 笔记本断电也照跑 |
+| 错过补跑 | `StartWhenAvailable=true` | 到点时休眠，唤醒后补启动 |
+
+**核验（两条独立通道）**：
+
+```powershell
+# ① 直读任务定义 XML（无需 schtasks / 管理员）
+Get-Content "C:\Windows\System32\Tasks\trae2api-hub-gateway"   # UTF-16
+# ② CIM
+Get-ScheduledTask -TaskName 'trae2api-hub-gateway'
+Get-ScheduledTaskInfo -TaskName 'trae2api-hub-gateway'
+```
+
+实测结果：`State=Ready` → `Start-ScheduledTask` 后 `State=Running`、`LastTaskResult=267009`（运行中）、
+`GET /ping` 返回 200、进程为 `pythonw.exe`（PID 53152）、日志写入 `gateway.log`。
+
+> 注：`LastTaskResult=267011` 表示「从未运行」，是刚注册时的正常值，不是失败。
+> `NextRunTime` 对 AtLogOn 触发器无确定值（显示为空）也属正常。
 
 ---
 

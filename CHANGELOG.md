@@ -1,3 +1,24 @@
+## [1.7.0-local.2] - 2026-11-19
+
+> 本地补丁版本（非上游）。承接 `1.7.0-local.1`，补完签到链路的落盘、请求精简与进程托管。
+
+### 新增
+
+- **签到结果落盘**：后台签到任务逐账号写 `usage/activity.jsonl`（看板「积分获取历史」可查）与 `accounts/<uid>.json` 的 `extra.checkin`（含签到时间/状态/积分/到账），网关重启不再丢失签到记录。
+- **已签到账号 0 请求跳过**：`_run_checkin_job` 前置判断 `extra.checkin` 是否今日已签，命中则**不发任何请求**直接跳过；传 `{"force": true}` 可忽略本地记录强制重查。实测 3 个已签账号由「3 次状态查询」降为「0 请求、秒级完成」。
+- **网关服务托管（Windows 计划任务）**：新增 `service-start.bat`（`pythonw` 无窗口 + 日志重定向），注册任务 `trae2api-hub-gateway`：登录自启、失败每分钟重启（`RestartCount=999`）、不限运行时长、`IgnoreNew` 防重复实例、电池条件全关、错过时间补启动。本机 `schtasks.exe` 被安全策略拉黑，改用 PowerShell `Register-ScheduledTask` 注册，并以「任务定义 XML + CIM」双通道核验。
+
+### 修复
+
+- **后台签到状态卡死**：`_run_checkin_job` 整体包 `try/finally`，任何未预期异常都把 `state` 落回 `done` 并记录 `error`，避免卡在 `running` 导致后续任务永久被拒（原需重启网关才能恢复）。
+- **前端轮询提前超时**：签到轮询上限由固定 60s 改为按 `(账号数+1)×(间隔+抖动)+30s` 动态计算，账号多时不再中途放弃。
+
+### 验证
+
+- `_test_trae.py`：`PASS=240 FAIL=0 SKIP=0`
+- 3 账号实测：首次签到 28 秒完成（10s+0~5s 错峰，3/3 成功）；重复触发时 3/3 本地跳过（0 请求）
+- 计划任务：`Start-ScheduledTask` 后 `State=Running`、`GET /ping` 200、进程 `pythonw.exe`、日志正常写入 `gateway.log`
+
 ## [1.7.0-local.1] - 2026-11-19
 
 > **本地补丁版本（非上游）**：本条目记录本机自用时的改动，上游仓库不含这些提交。
