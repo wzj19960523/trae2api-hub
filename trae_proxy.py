@@ -7361,7 +7361,12 @@ def checkin_job_state():
 
 
 def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
-    """后台线程：逐账号签到，间隔 interval + 0~jitter 随机，防风控。"""
+    """后台线程：逐账号签到，间隔 interval + 0~jitter 随机，防风控。
+
+    整体包 try/finally：任何未预料的异常（账号对象异常、随机数失败等）都必须
+    把 state 从 running 落回 done，否则 start_checkin_job 会永久拒绝新任务
+    （状态卡 running = 功能失效直到重启网关）。
+    """
     import trae_tasks
     _rng = rng or random
     targets = [a for a in (targets or []) if a is not None]
@@ -7373,55 +7378,60 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None):
             "interval": float(interval), "jitter": float(jitter),
         })
     last_at = None
-    for account in targets:
-        if account is None:
-            continue
-        label = account_label(account)
-        if not getattr(account, "enabled", True) or not getattr(account, "access_token", ""):
+    try:
+        for account in targets:
+            if account is None:
+                continue
+            label = account_label(account)
+            if not getattr(account, "enabled", True) or not getattr(account, "access_token", ""):
+                with CHECKIN_JOB_LOCK:
+                    CHECKIN_JOB_STATE["done"] += 1
+                    CHECKIN_JOB_STATE["skipped"] += 1
+                    CHECKIN_JOB_STATE["results"].append(
+                        {"uid": getattr(account, "uid", ""), "ok": False,
+                         "skipped": True, "msg": "账号已禁用或缺少凭证", "logs": []})
+                    CHECKIN_JOB_STATE["logs"].append("— [%s] 账号已禁用或缺少凭证，跳过" % label)
+                continue
+            # 防风控错峰：上次请求后至少等 interval + 0~jitter
+            if last_at is not None:
+                delay = float(interval) + float(_rng.uniform(0, jitter) if jitter > 0 else 0)
+                time.sleep(delay)
+            with CHECKIN_JOB_LOCK:
+                CHECKIN_JOB_STATE["current"] = label
+            try:
+                res = trae_tasks.run_checkin(account, gap=1.0, only_daily=True)
+                ok = bool(res.get("ok"))
+            except Exception as exc:
+                res = {"ok": False, "logs": [str(exc)[:200]]}
+                ok = False
+            finally:
+                last_at = time.time()
             with CHECKIN_JOB_LOCK:
                 CHECKIN_JOB_STATE["done"] += 1
-                CHECKIN_JOB_STATE["skipped"] += 1
-                CHECKIN_JOB_STATE["results"].append(
-                    {"uid": getattr(account, "uid", ""), "ok": False,
-                     "skipped": True, "msg": "账号已禁用或缺少凭证", "logs": []})
-                CHECKIN_JOB_STATE["logs"].append("— [%s] 账号已禁用或缺少凭证，跳过" % label)
-            continue
-        # 防风控错峰：上次请求后至少等 interval + 0~jitter
-        if last_at is not None:
-            delay = float(interval) + float(_rng.uniform(0, jitter) if jitter > 0 else 0)
-            time.sleep(delay)
+                CHECKIN_JOB_STATE["ok" if ok else "failed"] += 1
+                CHECKIN_JOB_STATE["results"].append({
+                    "uid": getattr(account, "uid", ""),
+                    "ok": ok,
+                    "earned_credit": res.get("earned_credit") or 0,
+                    "msg": (res.get("logs") or [""])[-1],
+                    "logs": res.get("logs") or [],
+                    "credits": res.get("credits"),
+                })
+                CHECKIN_JOB_STATE["logs"].extend(
+                    l for l in (res.get("logs") or []) if l.startswith(("✓", "!", "—")))
+    except Exception as exc:                                   # noqa: BLE001
         with CHECKIN_JOB_LOCK:
-            CHECKIN_JOB_STATE["current"] = label
-        try:
-            res = trae_tasks.run_checkin(account, gap=1.0, only_daily=True)
-            ok = bool(res.get("ok"))
-        except Exception as exc:
-            res = {"ok": False, "logs": [str(exc)[:200]]}
-            ok = False
-        finally:
-            last_at = time.time()
+            CHECKIN_JOB_STATE["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            CHECKIN_JOB_STATE["logs"].append("! 任务异常终止：%s" % str(exc)[:200])
+    finally:
         with CHECKIN_JOB_LOCK:
-            CHECKIN_JOB_STATE["done"] += 1
-            CHECKIN_JOB_STATE["ok" if ok else "failed"] += 1
-            CHECKIN_JOB_STATE["results"].append({
-                "uid": getattr(account, "uid", ""),
-                "ok": ok,
-                "earned_credit": res.get("earned_credit") or 0,
-                "msg": (res.get("logs") or [""])[-1],
-                "logs": res.get("logs") or [],
-                "credits": res.get("credits"),
+            CHECKIN_JOB_STATE.update({
+                "state": "done", "finished_at": time.time(), "current": "",
             })
-            CHECKIN_JOB_STATE["logs"].extend(
-                l for l in (res.get("logs") or []) if l.startswith(("✓", "!", "—")))
-    with CHECKIN_JOB_LOCK:
-        CHECKIN_JOB_STATE.update({
-            "state": "done", "finished_at": time.time(),
-            "current": "",
-        })
-    try:
-        trae_tasks.invalidate_panel_cache()
-    except Exception:
-        pass
+        try:
+            trae_tasks.invalidate_panel_cache()
+        except Exception:
+            pass
 
 
 def start_checkin_job(targets, interval=10.0, jitter=5.0):

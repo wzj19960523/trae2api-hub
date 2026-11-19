@@ -7121,7 +7121,13 @@ async function doCheckin(btn){
     if(!r || r.async){
       const job = (r && r.job) || {state:"starting"};
       toast((r && r.msg) || "后台签到任务已启动（10s+0~5s 错峰）", "ok");
-      // 轮询任务状态直到 done/idle
+      // 轮询任务状态直到 done/idle。
+      // 超时按账号数动态算：每账号最坏 interval+jitter（默认 15s）+ 请求余量，
+      // 避免账号多时 60s 固定超时提前退出（原来 5 个账号就会超时）。
+      const _total = (r && r.job && r.job.total) || 1;
+      const _iv = (r && r.job && r.job.interval) || 10;
+      const _jt = (r && r.job && r.job.jitter) || 5;
+      const HARD_TIMEOUT_MS = Math.max(60000, (_total + 1) * (_iv + _jt) * 1000 + 30000);
       const t0 = Date.now();
       const poll = setInterval(async () => {
         try{
@@ -7141,7 +7147,7 @@ async function doCheckin(btn){
             const cur = s.current || '';
             const pct = s.total ? Math.round(s.done / s.total * 100) : 0;
             btn.textContent = "签到中 " + pct + "%" + (cur ? " · " + cur : "");
-            if(Date.now() - t0 > 60000){ clearInterval(poll); btn.disabled=false; btn.textContent=ot; toast("签到仍在后台进行，可刷新查看", "warn"); }
+            if(Date.now() - t0 > HARD_TIMEOUT_MS){ clearInterval(poll); btn.disabled=false; btn.textContent=ot; toast("签到仍在后台进行，可刷新查看", "warn"); }
           }
         }catch(e){ /* 轮询失败静默，下次再试 */ }
       }, 1500);
