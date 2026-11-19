@@ -233,24 +233,81 @@ payload = {
 
 ## 6. 升级与回滚
 
-### 6.1 上游更新注意事项
+### 6.0 仓库结构与远端配置（fork 工作流）
 
-这些改动是本地补丁，`git pull` 时 `trae_accounts.py` 和 `trae_tasks.py` 可能产生冲突。建议：
+本仓库采用 **fork + 双远端 + 分支隔离** 结构：
+
+| 远端 | 地址 | 作用 |
+|---|---|---|
+| `origin` | `git@github.com:wzj19960523/trae2api-hub.git`（SSH） | 自己的 fork，push 用 |
+| `upstream` | `https://gh-proxy.com/https://github.com/shuishuipingan/trae2api-hub.git` | 作者原仓库，只 fetch |
+
+| 分支 | 内容 | 说明 |
+|---|---|---|
+| `main` | 纯上游 `3d2e23e` | 永不加本地 commit，保证 `merge --ff-only` 无冲突 |
+| `local` | 上游 + 本地补丁（`793addf`） | 日常使用/开发都在这个分支 |
+
+> **网络说明**：本机直连 GitHub HTTPS 会 502（会话代理 `http_proxy=127.0.0.1:xxxxx` 拦截）/ 免代理也超时，因此
+> `origin` 走 SSH（`~/.ssh/config` 已配 `github.com → ssh.github.com:443`，key 为 `id_ed25519_wzj`）；
+> `upstream` 走 gh-proxy 镜像仅用于 fetch。
+> HTTPS 操作需加 `-c http.proxy=` 绕开死代理。
+
+### 6.1 作者更新后如何跟进（核心流程）
 
 ```bash
-# 升级前先保存补丁
-git diff > docs/local-patches/local-changes-<日期>.patch
+# 1. 拉取作者最新代码（走镜像，fetch 不需要认证）
+git fetch upstream
 
-# 上游更新后重新应用（可能需手工解决冲突）
-git apply docs/local-patches/local-changes-<日期>.patch
+# 2. 更新 main：纯快进，永远不会冲突
+git checkout main
+git merge --ff-only upstream/main
+
+# 3. 把本地补丁重新叠到最新上游之上
+git checkout local
+git rebase main
+
+# 4. 重启网关让新代码生效
 ```
 
-或者：升级前 `git stash`，`git pull` 后 `git stash pop`，冲突时按本文第 2、3 节描述手工合并。
+**冲突处理**（只可能发生在第 3 步，通常集中在 `CHANGELOG.md`、`trae_accounts.py`、`trae_tasks.py`、`trae_proxy.py`、`dashboard.html`）：
+
+```bash
+# 手工编辑冲突文件 → 标记已解决 → 继续
+git add <冲突文件>
+git rebase --continue
+
+# 放弃本次 rebase，回到操作前
+git rebase --abort
+```
+
+**推送到自己的 fork**（让远端也同步）：
+
+```bash
+git push origin local          # 首次已 -u，之后直接 push
+# rebase 改写了提交历史时（本地已 push 过），需要：
+git push --force-with-lease origin local
+```
+
+**验证清单**：
+
+```bash
+git log --oneline -3 main          # 应为作者最新提交
+git log --oneline -3 local         # 第一条应是你自己的补丁提交
+git rev-list --count main..upstream/main   # 应为 0
+git ls-remote origin local         # 上帝视角确认远端 SHA 与本地一致
+```
 
 ### 6.2 回滚代码改动
 
 ```bash
-git checkout -- trae_accounts.py trae_tasks.py
+# 方式 A：丢弃 local 分支上的全部补丁（回到纯上游代码）
+git checkout main
+
+# 方式 B：撤销单个文件的改动（在 local 分支）
+git checkout HEAD~1 -- trae_accounts.py
+
+# 方式 C：整体回退到某个提交
+git reset --hard <commit-sha>
 ```
 
 注意：回滚后 `checkin_when_disabled` 字段会保留在账号 JSON 里（无害，代码不读），
@@ -266,7 +323,10 @@ cp accounts/import-3f9e96a96c14ba8a70a0.json.bak-uidfix \
 
 ### 6.4 建议的上游反馈
 
-这两个 bug 值得向作者提 issue：
+这两个 bug 值得向作者提 issue / PR：
 
 1. `checkin_when_disabled` 勾选不生效（字段未纳入 `to_dict()` / `public()`，签到任务未读）
 2. import 账号伪 uid 导致刷新 20101（`normalise_import_row` 应从 JWT 提取真实 uid）
+
+已在 fork 上创建 `local` 分支，可直接用 GitHub 的对比页面向上游发起 PR：
+`https://github.com/wzj19960523/trae2api-hub/pull/new/local`
