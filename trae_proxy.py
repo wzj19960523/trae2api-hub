@@ -6346,6 +6346,14 @@ def trae_solo_chat(account, payload, timeout=180):
                 usage = {"prompt_tokens": int(event.get("prompt_tokens") or 0),
                          "completion_tokens": int(event.get("completion_tokens") or 0),
                          "total_tokens": int(event.get("total_tokens") or 0)}
+    except Exception as exc:                              # noqa: BLE001
+        # 已经收到过内容（文本/推理/工具帧）说明上游已开始生成并很可能已计费：
+        # 这种情况下重放会**重复消耗额度**。把标记挂到异常上，由上层决定不重试。
+        try:
+            exc.solo_received = bool(text_parts or reasoning_parts or tool_slots)
+        except Exception:
+            pass
+        raise
     finally:
         try:
             resp.close()
@@ -7315,6 +7323,10 @@ def extract_session_key(headers, payload):
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+# SOLO 重试的墙钟上限：单次 trae_solo_chat 的 timeout 是 180s，若无上限
+# 最坏 3×180+3 ≈ 543s，而客户端（WorkBuddy）早就超时放弃了 —— 白白占用
+# 连接并重复计费。超过该时长说明是「慢」而不是「瞬时断连」，不再重放。
+SOLO_RETRY_MAX_ELAPSED = 60.0
 
 # issue #38：上游「排队」（403 + isQueued/10605 + retryAfterSeconds）时，
 # 网关**等队列放行后重试**，而不是把排队 JSON 当错误交给客户端——客户端会把
@@ -7368,6 +7380,45 @@ def checkin_job_state():
 
 
 def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None, force=False):
+    """后台签到任务入口：**保证任何异常都把 state 落回 done**。
+
+    真正的实现在 `_run_checkin_job_inner`。之所以要这一层包装：inner 的
+    prologue（`import trae_tasks` / `float(interval)` / 初始化 state）在它自己的
+    try 之外，一旦那里抛异常（模块缺失、类型错误），state 会停在 `starting`；
+    而 `start_checkin_job` 拒绝 `starting` → 签到功能永久锁死，只能重启进程。
+    """
+    try:
+        import trae_tasks
+        # 与调度器共用签到互斥：已有周期任务在跑时不再并发 claim 同一批账号。
+        if not trae_tasks.CHECKIN_MUTEX.acquire(blocking=False):
+            with CHECKIN_JOB_LOCK:
+                CHECKIN_JOB_STATE.update({
+                    "state": "done", "finished_at": time.time(),
+                    "error": "已有签到任务在运行（调度器），本次跳过",
+                })
+            log("checkin job skipped: another checkin task is running",
+                level="WARN", tag="tasks")
+            return None
+        try:
+            return _run_checkin_job_inner(targets, interval, jitter, rng, force)
+        finally:
+            trae_tasks.CHECKIN_MUTEX.release()
+    except Exception as exc:                               # noqa: BLE001
+        with CHECKIN_JOB_LOCK:
+            CHECKIN_JOB_STATE.update({
+                "state": "done", "finished_at": time.time(), "current": "",
+                "error": "任务初始化失败: %s: %s"
+                         % (type(exc).__name__, str(exc)[:160]),
+            })
+        try:
+            log("checkin job crashed before init: %s" % str(exc)[:160],
+                level="WARN", tag="tasks")
+        except Exception:
+            pass
+        return None
+
+
+def _run_checkin_job_inner(targets, interval=10.0, jitter=5.0, rng=None, force=False):
     """后台线程：逐账号签到，间隔 interval + 0~jitter 随机，防风控。
 
     整体包 try/finally：任何未预料的异常（账号对象异常、随机数失败等）都必须
@@ -7395,15 +7446,27 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None, force=False):
             if account is None:
                 continue
             label = account_label(account)
-            if not getattr(account, "enabled", True) or not getattr(account, "access_token", ""):
+            # 禁用账号默认跳过；只有勾选「禁用仍签到」（checkin_when_disabled）
+            # 才继续。只判 enabled 会让该勾选在后台签到路径上完全失效。
+            _enabled = bool(getattr(account, "enabled", True))
+            _allow_disabled = bool(getattr(account, "checkin_when_disabled", False))
+            if (not _enabled and not _allow_disabled) \
+                    or not getattr(account, "access_token", ""):
                 with CHECKIN_JOB_LOCK:
                     CHECKIN_JOB_STATE["done"] += 1
                     CHECKIN_JOB_STATE["skipped"] += 1
                     CHECKIN_JOB_STATE["results"].append(
                         {"uid": getattr(account, "uid", ""), "ok": False,
-                         "skipped": True, "msg": "账号已禁用或缺少凭证", "logs": []})
-                    CHECKIN_JOB_STATE["logs"].append("— [%s] 账号已禁用或缺少凭证，跳过" % label)
+                         "skipped": True,
+                         "msg": "账号已禁用或缺少凭证（未勾选「禁用仍签到」）",
+                         "logs": []})
+                    CHECKIN_JOB_STATE["logs"].append(
+                        "— [%s] 账号已禁用或缺少凭证，跳过" % label)
                 continue
+            if not _enabled:
+                with CHECKIN_JOB_LOCK:
+                    CHECKIN_JOB_STATE["logs"].append(
+                        "… [%s] 账号已禁用，但勾选了「禁用仍签到」，继续" % label)
             # 本地「今日已签到」判断：命中则 0 请求直接跳过
             ck = (getattr(account, "extra", {}) or {}).get("checkin") or {}
             if (not force and str(ck.get("at") or "").startswith(today)
@@ -7456,17 +7519,21 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None, force=False):
                     l for l in (res.get("logs") or []) if l.startswith(("✓", "!", "—")))
             # 落盘 1/2：账号文件里的今日签到记录（供下次「本地已签跳过」判断，
             # 也让看板账号行显示签到状态）。失败不影响主流程。
+            #
+            # 只在 ok=True 时覆盖：签到失败（网络抖动/上游 5xx）不能把当天已有的
+            # 「已签到」记录改写成「未签到」，否则看板徽标会倒退，下次还会重复请求。
             try:
-                account.extra = dict(getattr(account, "extra", {}) or {})
-                account.extra["checkin"] = {
-                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "checked_in": bool(ok),
-                    "credits": (res.get("credits") or {}).get("remain")
-                    if isinstance(res.get("credits"), dict) else res.get("credits"),
-                    "earned_credit": int(res.get("earned_credit") or 0),
-                }
-                if hasattr(account, "save"):
-                    account.save(ACCOUNTS_DIR)
+                if ok:
+                    account.extra = dict(getattr(account, "extra", {}) or {})
+                    account.extra["checkin"] = {
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "checked_in": True,
+                        "credits": (res.get("credits") or {}).get("remain")
+                        if isinstance(res.get("credits"), dict) else res.get("credits"),
+                        "earned_credit": int(res.get("earned_credit") or 0),
+                    }
+                    if hasattr(account, "save"):
+                        account.save(ACCOUNTS_DIR)
             except Exception:
                 pass
             # 落盘 2/2：usage/activity.jsonl 流水（看板「积分获取历史」读它）
@@ -7500,13 +7567,28 @@ def start_checkin_job(targets, interval=10.0, jitter=5.0, force=False):
     force=True 表示忽略本地「今日已签」记录，强制重新查询/领取。
     """
     with CHECKIN_JOB_LOCK:
-        if CHECKIN_JOB_STATE.get("state") == "running":
+        # starting 同样要拒绝：否则「置 starting → 启动线程 → 线程内改 running」
+        # 这个微秒级窗口里第二个请求会再起一个线程，导致同一批账号被并发签到。
+        if CHECKIN_JOB_STATE.get("state") in ("running", "starting"):
             return False, checkin_job_state()
         CHECKIN_JOB_STATE["state"] = "starting"
     thread = threading.Thread(target=_run_checkin_job,
                               args=(targets, interval, jitter, None, force),
                               daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except Exception as exc:                               # noqa: BLE001
+        # 线程起不来时必须把 starting 落回 done，否则上面「starting 也拒绝」
+        # 会让签到功能永久不可用（只能重启进程）。
+        with CHECKIN_JOB_LOCK:
+            CHECKIN_JOB_STATE.update({
+                "state": "done", "finished_at": time.time(),
+                "error": "线程启动失败: %s: %s"
+                         % (type(exc).__name__, str(exc)[:160]),
+            })
+        log("checkin job thread failed to start: %s" % str(exc)[:160],
+            level="WARN", tag="tasks")
+        return False, checkin_job_state()
     return True, checkin_job_state()
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
@@ -10978,7 +11060,14 @@ class Handler(BaseHTTPRequestHandler):
                 result = trae_solo_chat(account, {**payload, "model": model})
                 break
             except Exception as exc:
+                # 不重放的三种情况：
+                # ① 已达重试上限；
+                # ② `solo_received` = 流里已收到过内容 → 上游已生成/计费，重放会重复扣额度；
+                # ③ 带明确 HTTP 状态码（应用层错误，重放必然同样失败）。
                 if (attempt >= TRANSIENT_MAX_RETRIES
+                        or getattr(exc, "solo_received", False)
+                        or (time.monotonic() - started) > SOLO_RETRY_MAX_ELAPSED
+                        or isinstance(exc, urllib.error.HTTPError)
                         or not _is_transient_transport(exc)):
                     record_error(model, 502, str(exc)[:200],
                                  elapsed_ms=int((time.monotonic()-started)*1000))

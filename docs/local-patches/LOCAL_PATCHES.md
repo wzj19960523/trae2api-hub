@@ -559,3 +559,38 @@ def _resolve_credits(account, snapshot=None):
 | `/tasks?realm=cn` | `energy=4820.61`（2254.38+597.56+411.37+1557.3）、`streak_days=1`、无 `credits_unknown_accounts` |
 | `/usage/by-account` | 每行带 `uidHash`，`requests`/`total_tokens` 与日志一致 |
 | `_test_trae.py` | `PASS=240 FAIL=0` |
+
+### 1.6 Patch 10：四路对抗性交叉复核（发现 3 个 P0/P1 级自身缺陷）
+
+**方法**：按域切四路并行子进程（签到引擎 / 看板数据 / 凭证与网络 / 前后端契约），
+每路以「**证伪**」为目标、强制给 `文件:行号` 与复现方式；主控独立复核关键项并亲跑命令。
+复核前基线：`local@e187ac3`。复核后全部修复如下。
+
+| # | 来源 | 级别 | 缺陷 | 主控复核方式 | 处置 |
+|---|---|---|---|---|---|
+| 1 | 主控自查 | **P0** | `_uid_from_access_token` 无字符校验，`{"data":{"id":"../../evil"}}` 可让账号文件写出 `accounts/`（导入接口接受任意 token） | 构造 9 种畸形 payload 实跑 + Windows 原生 `normpath` 验路径 | 新增 `safe_uid()`，显式 uid 同样过闸；9/9 拒绝 |
+| 2 | S1 | **P0** | `_run_checkin_job` prologue 在 try 外，import/类型错误让 state 卡 `starting` → 签到永久不可用 | `sys.modules["trae_tasks"]=None` 打桩，实跑 | 外层包装兜底，异常落 `done` |
+| 3 | S1 | P1 | 「禁用仍签到」勾选全链路失效：`_iter_accounts` 默认过滤禁用账号 ⇒ 分支不可达；后台任务也不读该字段 | 打桩 client 实跑，打印真正发起 claim 的 uid 列表 | `include_disabled=True` + 两处读 `checkin_when_disabled`；实测 `['dis-allow','enabled']` |
+| 4 | S1 | P1 | 调度器与后台任务无互斥，可能并发 claim 同一账号 | 持锁后调用，验证返回 `busy` | 新增 `CHECKIN_MUTEX` 共用 |
+| 5 | S2 | P1 | `mode=="all"` 且全账号未知时 `energy=0`，违反「未知≠0」 | 读代码 + 构造全未知场景 | 改为 `null` + `energy_note` |
+| 6 | S2 | P1 | `entitlement` 汇总优先用陈旧快照且 `int()` 截断 | 对照实时值与快照值 | 实时优先 + float 累加 |
+| 7 | S3 | P1 | SOLO 重试在「已收到流内容」时重放 → 重复计费 | 读 `trae_solo_chat` 流循环，确认异常穿透点 | 异常挂 `solo_received` 标记，上层不重试 |
+| 8 | S3 | P1 | 重试无墙钟上限（最坏 543s） | 读常量与 timeout | `SOLO_RETRY_MAX_ELAPSED=60s` |
+| 9 | S3 | P1 | `Stop-ScheduledTask` 杀不掉 `pythonw`，缺停机手段 | 本日实测（改代码后旧进程仍活） | 新增 `service-stop.bat` |
+| 10 | S4 | P1 | 福利中心异步改造丢了 `payload`（单账号领取作用于全部）+ `return` 跳过 Pro 包 | 读 8446-8473 行，确认 payload 被覆盖 | 合并 payload、完成后补领 Pro |
+| 11 | S4 | P1 | 签到轮询异常时永不收尾（按钮永久禁用） | 读 poll 的 catch 分支 | 超时闸门移到 try 之外 |
+| 12 | 主控端到端 | P1 | 签到失败会覆盖当天已成功的 `extra.checkin`（徽标从 True 翻 False） | 端到端实跑时**实际复现**（某账号网络抖动后翻 False） | 仅成功时覆盖，并修复被写坏的记录 |
+| 13 | 主控自查 | P1 | `start_checkin_job` 只拒 `running`，`starting` 窗口内可重复起线程 | 10 线程并发实跑 | `running`/`starting` 均拒 + `Thread.start()` 兜底 |
+| 14 | S3 | P2 | `findstr ":8791"` 命中 `:87910` | 读 bat | 改 `":8791 "` |
+| 15 | S2 | P2 | `_as_float` 放行 inf/nan → JSON 输出 `Infinity` → 前端解析崩 | 构造 `float("inf")` 用例 | 收敛为 0 |
+| 16 | S2 | P2 | `_checkin_streak` 把字符串 `"false"` 当真值 | 构造 activity 行 | 严格判真 |
+
+**冲突裁定**：S3 报「`_is_transient_transport` 对 `OSError` 全放行」，主控实测 `HTTPError(401/403/429)` 均返回 `False`（走 `reason` 字符串分支），
+且 `trae_solo_chat` 已把 `HTTPError` 包装成 `RuntimeError` —— 故**不修改**该函数（影响 5 处调用点、风险大于收益），
+改为在 SOLO 重试点单独加 `HTTPError` 与 `solo_received` 双重排除。
+
+**流程教训**：S3 指出其读到的 diff 是主控修复前的旧快照（基线漂移）。多路并行时若主控在中途改代码，
+**必须在派活后冻结源码**，否则子进程的 `文件:行号` 会指向已变化的行。
+
+**复核后验证**：`PASS=240 FAIL=0`；4 账号签到 `4/4 ok=true`；`energy=4820.61`、`streak_days=1`；
+`checkedInToday` 全 true；前端 3 个 script 块 `node --check` 全通过。

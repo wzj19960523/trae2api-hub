@@ -1,3 +1,46 @@
+## [1.7.0-local.6] - 2026-11-19
+
+> 本地补丁版本（非上游）。**四路对抗性交叉复核**（签到引擎 / 看板数据 / 凭证与网络 / 前后端契约）后修复的问题。
+
+### 安全
+
+- **导入 uid 路径穿越（P0）**：`_uid_from_access_token` 直接返回 JWT 里的 `data.id`，构造 `{"data":{"id":"../../evil"}}` 的 token 会让账号文件写出 `accounts/` 目录。新增 `safe_uid()` 白名单收敛（长度 ≤64、拒绝路径分隔符/Windows 非法字符/控制字符/`.`/`..`），显式 uid 同样过闸；不合规回退 `import-<hash>` 伪 uid。
+
+### 修复
+
+- **后台签到状态永久锁死（P0）**：`_run_checkin_job` 的 prologue（`import trae_tasks`、`float(interval)`、state 初始化）在 try 之外，失败时 state 停在 `starting`，而 `start_checkin_job` 拒绝 `starting` → 功能永久不可用。改为外层包装函数兜底，任何异常都落回 `done`。
+- **「禁用仍签到」勾选形同虚设（P1）**：`task_daily_checkin` 用 `_iter_accounts` 默认过滤掉禁用账号，导致循环内「禁用+勾选」分支**永远不可达**；后台任务 `_run_checkin_job` 也只判 `enabled`、不读 `checkin_when_disabled`。两处均已修，实测「禁用+勾选」会真正发起签到、「禁用未勾选」仍跳过。
+- **签到无互斥（P1）**：调度器周期任务与面板后台任务可能对同一账号并发 claim。新增 `trae_tasks.CHECKIN_MUTEX`，两条路径共用；已持锁时后者如实返回 `busy` 而非排队重试。
+- **定时签到不落盘（P1）**：`task_daily_checkin` 只改内存里的 `extra.checkin`，重启后 `checkedInToday` 与「今日已签跳过」全部失效。补 `account.save()`。
+- **失败覆盖已签到记录（P1）**：签到失败时也会写入 `checked_in: false`，把当天已成功的记录改写成未签到（端到端实测复现：一次网络抖动让某账号从 True 翻成 False）。改为仅成功时覆盖。
+- **SOLO 重试可能重复计费（P1）**：流里已收到过内容再重放会重复消耗额度。`trae_solo_chat` 在流读取异常时给异常挂 `solo_received` 标记，上层据此放弃重试。
+- **SOLO 重试无墙钟上限（P1）**：最坏 3×180s+3s ≈ 543s，客户端早已超时。新增 `SOLO_RETRY_MAX_ELAPSED=60s`：超过 60 秒视为「慢」而非「瞬时断连」，不再重放。
+- **批量视图全未知时合计报 0（P1）**：`mode=="all"` 且所有账号都拿不到余额时，`energy` 仍是 0，违反「未知≠0」契约。改为 `null` + 说明。
+- **entitlement 汇总用陈旧快照且 int 截断（P1）**：改为实时摘要优先、快照兜底，金额用 float 累加。
+- **福利中心「领取全部福利」丢失账号过滤（P1）**：异步改造时把 `payload` 换成了 `{async:true}`，单账号领取实际作用于全部账号；且 `return` 跳过了 Pro 福利包领取。已改为合并 payload，并在签到完成后补领 Pro 包。
+- **签到轮询异常时永不收尾（P1）**：轮询请求本身失败（网关重启/401）时 timer 不清理、按钮永久禁用。把超时闸门移到 try 之外，任何情况下都能收尾。
+- **并发启动竞态（P1）**：`start_checkin_job` 只拒绝 `running`，`starting` 窗口内第二个请求会再起线程。改为 `running`/`starting` 均拒绝，并为 `Thread.start()` 失败补兜底。
+- **看门狗端口子串误匹配（P2）**：`findstr ":8791"` 会命中 `:87910`，改为 `":8791 "`。
+- **`_as_float` 放行 inf/nan（P2）**：`json.dumps` 会输出 `Infinity`/`NaN`，前端 `JSON.parse` 直接抛错导致整个看板加载失败。收敛为 0。
+- **`_checkin_streak` 的 ok 判真过宽（P2）**：字符串 `"false"` 在 Python 是真值，会把失败记录算进连续天数。改为严格判真。
+
+### 新增
+
+- `service-stop.bat`：按端口精确结束网关进程。说明：任务计划程序的「结束」不会杀掉 `pythonw` 子进程，需显式结束监听者。
+
+### 已知未修（可接受）
+
+- 后台签到「本地已签跳过」时 `results[].ok=true` 但 `ok` 计数不递增 → 前端汇总文案与实际请求数口径略有差异（不影响展示）。
+- `activity.jsonl` 跨进程追加无显式锁（单行小写入，交错风险低）。
+- `MiMo-V2.6-Flash` 等模型的 `reasoning_content` 会回填到响应里（上游行为，非本次改动引入）。
+
+### 验证
+
+- `_test_trae.py`：`PASS=240 FAIL=0`
+- 三项新修复的正反向用例：路径穿越 9 种畸形输入全拒、并发 10 线程仅 1 个启动、import 失败状态落回 done、失败不覆盖已签到
+- 端到端：4 账号签到 `4/4 ok=true`，`checkedInToday` 全为 true，`energy=4820.61`，`streak_days=1`
+- 前端 3 个内联 script 块 `node --check` 全通过
+
 ## [1.7.0-local.5] - 2026-11-19
 
 > 本地补丁版本（非上游）。修复看板四个区域显示异常：今日签到徽标、积分合计、连续签到天数、请求/TOKEN/缓存列。

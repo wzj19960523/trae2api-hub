@@ -7130,6 +7130,13 @@ async function doCheckin(btn){
       const HARD_TIMEOUT_MS = Math.max(60000, (_total + 1) * (_iv + _jt) * 1000 + 30000);
       const t0 = Date.now();
       const poll = setInterval(async () => {
+        // 超时闸门放在 try 之外：轮询请求本身失败（网关重启/401）时也必须能收尾，
+        // 否则按钮永久禁用、timer 永不清理。
+        if(Date.now() - t0 > HARD_TIMEOUT_MS){
+          clearInterval(poll); btn.disabled = false; btn.textContent = ot;
+          toast("签到仍在后台进行，可刷新查看", "warn");
+          return;
+        }
         try{
           const s = await postJSON("/tasks/checkin-job", {});
           const done = s.state === "done" || s.state === "idle";
@@ -7147,9 +7154,8 @@ async function doCheckin(btn){
             const cur = s.current || '';
             const pct = s.total ? Math.round(s.done / s.total * 100) : 0;
             btn.textContent = "签到中 " + pct + "%" + (cur ? " · " + cur : "");
-            if(Date.now() - t0 > HARD_TIMEOUT_MS){ clearInterval(poll); btn.disabled=false; btn.textContent=ot; toast("签到仍在后台进行，可刷新查看", "warn"); }
           }
-        }catch(e){ /* 轮询失败静默，下次再试 */ }
+        }catch(e){ /* 单次轮询失败继续；收尾由上面的超时闸门保证 */ }
       }, 1500);
     } else {
       const res = r.results || [];
@@ -8447,7 +8453,9 @@ async function runGrowthTasks(btn){
     if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
       payload.uid = CURRENT_GROWTH_UID;
     }
-    const r = await postJSON("/tasks/run", {async:true});
+    // 必须带上 payload（账号过滤）：早前直接传 {async:true} 会把 uid 丢掉，
+    // 导致「对单个账号领取」实际作用于全部账号。
+    const r = await postJSON("/tasks/run", Object.assign({}, payload, {async:true}));
     if(r && r.async){
       // 后台错峰签到：立即提示，轮询进度
       toast((r.msg) || "后台签到已启动（10s+0~5s 错峰）", "ok");
@@ -8455,7 +8463,19 @@ async function runGrowthTasks(btn){
         logBox.style.display = 'block';
         logBox.innerHTML = '<div style="color:var(--accent)">' + esc(r.msg || '后台签到任务已启动') + '</div><div style="color:var(--dim)">任务在后台逐账号执行，完成后自动刷新...</div>';
       }
+      const _total = (r.job && r.job.total) || 1;
+      const _iv = (r.job && r.job.interval) || 10;
+      const _jt = (r.job && r.job.jitter) || 5;
+      const HARD_TIMEOUT_MS = Math.max(60000, (_total + 1) * (_iv + _jt) * 1000 + 30000);
+      const t0 = Date.now();
       const poll = setInterval(async () => {
+        // 超时/异常都必须能收尾，否则按钮和轮询会永久卡住
+        if(Date.now() - t0 > HARD_TIMEOUT_MS){
+          clearInterval(poll);
+          if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">签到仍在后台进行，可稍后刷新查看</div>';
+          btn.disabled = false; btn.textContent = oldText;
+          return;
+        }
         try{
           const s = await postJSON("/tasks/checkin-job", {});
           if(s.state === "done" || s.state === "idle"){
@@ -8463,11 +8483,23 @@ async function runGrowthTasks(btn){
             const lines = (s.logs || []).slice(-15);
             if(logBox) logBox.innerHTML = (lines.length ? lines : ['（无日志）']).map(l => '<div>' + esc(l) + '</div>').join('');
             let sum = 0; (s.results || []).forEach(x => sum += (x.earned_credit || 0));
+            // 签到完成后补领 Pro 福利包：原同步路径在这里做，异步分支不能丢
+            let proMsg = '';
+            try{
+              const t = await postJSON("/tasks/travel", payload);
+              if(t && t.msg) proMsg = t.msg;
+              if(logBox){
+                logBox.innerHTML += '<div>--- Pro 福利包 ---</div>'
+                  + ((t.logs || []).map(l => '<div>' + esc(l) + '</div>').join('') || '');
+              }
+            }catch(e2){
+              if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">Pro 福利包领取跳过: ' + esc(e2 && e2.message) + '</div>';
+            }
             await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
-            toast("后台签到完成" + (sum ? '，新增 +' + sum + ' 积分' : '') + "！");
+            toast("后台签到完成" + (sum ? '，新增 +' + sum + ' 积分' : '') + (proMsg ? ('；Pro: ' + proMsg.slice(0, 40)) : '') + "！");
             btn.disabled = false; btn.textContent = oldText;
           }
-        }catch(e){}
+        }catch(e){ /* 单次轮询失败继续，超时由上面的闸门兜底 */ }
       }, 1500);
       return;
     }

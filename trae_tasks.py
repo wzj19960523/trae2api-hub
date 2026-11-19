@@ -95,6 +95,9 @@ TASK_NAMES = {d["code"]: d["name"] for d in TASK_DEFS}
 _log = lambda msg: None
 _panel_cache = {}
 _panel_lock = threading.Lock()
+# 签到互斥：后台 /tasks/run 任务与调度器周期任务共用一把锁，
+# 否则两条路径可能对同一账号并发 claim（重复请求、放大风控面）。
+CHECKIN_MUTEX = threading.Lock()
 _STATE_LOCK = threading.RLock()
 _TOKENISH_RE = re.compile(r"[A-Za-z0-9_\-]{32,}")
 
@@ -803,7 +806,11 @@ def _checkin_streak(days=None):
                         continue
                     if str(row.get("kind") or "") != "checkin":
                         continue
-                    if not row.get("ok"):
+                    # ok 只认真值：字符串 "false" 在 Python 里是真值，
+                    # 直接 `if not row.get("ok")` 会把失败记录算进连续天数。
+                    _ok = row.get("ok")
+                    if not (_ok is True or _ok == 1
+                            or str(_ok).strip().lower() == "true"):
                         continue
                     try:
                         ts = float(row.get("ts") or 0)
@@ -1017,15 +1024,21 @@ def _find_number(obj, names):
 
 
 def _as_float(value):
-    """金额专用：保留两位小数（余额 597.56 不能被 int 截成 597）。"""
+    """金额专用：保留两位小数（余额 597.56 不能被 int 截成 597）。
+
+    inf/nan 必须收敛成 0：它们会被 json.dumps 写成 `Infinity`/`NaN`，
+    前端 JSON.parse 会直接抛错，整个看板数据加载失败。
+    """
     if isinstance(value, bool) or value is None:
         return 0.0
-    if isinstance(value, (int, float)):
-        return round(float(value), 2)
     try:
-        return round(float(str(value).strip()), 2)
+        num = float(value if isinstance(value, (int, float))
+                    else str(value).strip())
     except (TypeError, ValueError):
         return 0.0
+    if num != num or num in (float("inf"), float("-inf")):
+        return 0.0
+    return round(num, 2)
 
 
 def _find_amount(obj, names):
@@ -1546,6 +1559,29 @@ def _reminder_counts(alerts):
 # ---------------------------------------------------------------------------
 def task_daily_checkin(pool=None, accounts=None, trigger="manual",
                        pacing=None, **kwargs):
+    """每日签到（外层入口）：加互斥，避免与后台 /tasks/run 任务并发 claim。
+
+    真正的实现在 `_task_daily_checkin_locked`。两条路径（调度器周期任务 /
+    面板后台任务）共用 `CHECKIN_MUTEX`：已有任务在跑时本次直接跳过并如实
+    上报，而不是排队后再对同一账号重复请求。
+    """
+    if not CHECKIN_MUTEX.acquire(blocking=False):
+        return {"ok": False, "task": "daily_checkin",
+                "summary": "已有签到任务在运行，本次跳过",
+                "stats": {"checked": 0, "already": 0, "failed": 0,
+                          "skipped": 0, "earned_credit": 0, "busy": True},
+                "logs": ["— 已有签到任务在运行，本次跳过"],
+                "accounts": {}, "record": None}
+    try:
+        return _task_daily_checkin_locked(pool=pool, accounts=accounts,
+                                          trigger=trigger, pacing=pacing,
+                                          **kwargs)
+    finally:
+        CHECKIN_MUTEX.release()
+
+
+def _task_daily_checkin_locked(pool=None, accounts=None, trigger="manual",
+                               pacing=None, **kwargs):
     """每日签到（仅 CN 真实可用）。
 
     调用 trae_client.claim_checkin：先查 status，已签到则幂等返回；未签到才
@@ -1557,7 +1593,11 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
     """
     started = time.time()
     client = _client_module()
-    targets = _iter_accounts(pool=pool, accounts=accounts)
+    # include_disabled=True：禁用账号必须进入循环，才能由下面的
+    # 「禁用 + 勾选『禁用仍签到』」逻辑决定跳过还是继续。此前用默认
+    # （过滤禁用账号）会让该分支**永远不可达**，勾选形同虚设。
+    targets = _iter_accounts(pool=pool, accounts=accounts,
+                             include_disabled=True)
     pacing = _ensure_pacing(pacing, "checkin")
     waits = []
     paced_seconds = 0.0
@@ -1620,14 +1660,23 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
             logs.append("! [%s] 签到未生效：%s"
                         % (name, res.get("message") or "未知原因"))
         snapshot[uid] = dict(res)
-        try:
-            account.extra = dict(getattr(account, "extra", {}) or {})
-            account.extra["checkin"] = {
-                "at": _iso(), "checked_in": bool(res.get("checked_in")),
-                "credits": res.get("credits"), "earned_credit": res.get("earned_credit") or 0,
-            }
-        except Exception:
-            pass
+        # 只在签到成功（或上游明确回报已签到）时覆盖记录：失败不能把当天的
+        # 「已签到」改写成「未签到」，否则徽标倒退且下次重复请求。
+        if res.get("ok") or res.get("checked_in"):
+            try:
+                account.extra = dict(getattr(account, "extra", {}) or {})
+                account.extra["checkin"] = {
+                    "at": _iso(),
+                    "checked_in": bool(res.get("checked_in") or res.get("ok")),
+                    "credits": res.get("credits"),
+                    "earned_credit": res.get("earned_credit") or 0,
+                }
+                # 必须落盘：只在内存里改的话，重启后 checkedInToday 与
+                # 「今日已签跳过」全部失效（定时任务路径此前正是这样）。
+                if hasattr(account, "save"):
+                    account.save()
+            except Exception:
+                pass
     ok = failed == 0
     finished = time.time()
     summary = ("每日签到：新签 %d，已签 %d，跳过 %d，失败 %d，到账 %s"
@@ -2487,15 +2536,23 @@ def _build_summary(accounts, state, mode=None, realm=None):
                 usage_total[key] += int(usage.get(key) or 0)
             usage_total["source"] = usage_total["source"] or str(
                 usage.get("source") or "")
-        ent = snapshot.get("entitlement") or {}
-        if not ent:
-            stored_ent = getattr(account, "entitlement", None)
-            if isinstance(stored_ent, dict) and stored_ent:
-                ent = _digest_entitlement(stored_ent, "account.entitlement")
+        # 同 credits：历史快照可能是旧解析逻辑的产物，实时算优先、快照兜底。
+        ent = _digest_entitlement(getattr(account, "entitlement", None),
+                                  "account.entitlement") \
+            if isinstance(getattr(account, "entitlement", None), dict) else {}
+        if not ent.get("ok"):
+            ent = snapshot.get("entitlement") or {}
         if ent.get("ok"):
             ent_total["ok"] += 1
-            ent_total["remain"] += int(ent.get("remain") or 0)
-            ent_total["total"] += int(ent.get("total") or 0)
+            # 金额保留小数：int() 会让合计与账号卡片对不上账
+            try:
+                ent_total["remain"] += float(ent.get("remain") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                ent_total["total"] += float(ent.get("total") or 0)
+            except (TypeError, ValueError):
+                pass
             ent_exp = int(ent.get("expires_at") or 0)
             if ent_exp and (not ent_total["expires_at"]
                             or ent_exp < ent_total["expires_at"]):
@@ -2533,12 +2590,18 @@ def _build_summary(accounts, state, mode=None, realm=None):
     }
     if unknown_uids:
         summary["credits_unknown_accounts"] = unknown_uids
-        # 单账号视图沿用旧 dashboard 的「未知 ≠ 0」契约（energy=null + 说明）
-        if mode != "all" and not energy:
+        # 「未知 ≠ 0」对两种视图都成立：单账号视图保留原契约；批量视图若
+        # **一个账号都没拿到余额**（energy 仍为 0），合计同样不可知 ——
+        # 直接报 0 会让用户以为额度耗尽（issue #25 的原症状）。
+        if not energy:
             summary["energy"] = None
             summary["credits_unknown"] = True
             summary["energy_note"] = ("余额未知（上游未提供余额字段或刷新失败，"
                                       "等待下次成功刷新）")
+        else:
+            summary["energy_note"] = ("合计仅包含 %d 个账号；%d 个账号余额未知未计入"
+                                      % (len(accounts) - len(unknown_uids),
+                                         len(unknown_uids)))
     return summary
 
 

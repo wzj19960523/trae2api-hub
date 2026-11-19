@@ -2845,6 +2845,30 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
     }
 
 
+def safe_uid(value):
+    """把外部来源（JWT / 用户输入）的 uid 收敛成可安全落盘的标识。
+
+    uid 会被拼成 `accounts/<uid>.json`，若原样使用 `../../evil` 或
+    `/etc/passwd` 会**写出 accounts 目录**（导入接口接受任意 token，
+    等于可被构造的路径穿越）。这里做白名单式收敛：
+      - 长度 1~64；
+      - 不含路径分隔符与 Windows 非法文件名字符；
+      - 不是 "." / ".."。
+    不合规一律返回空串，由调用方回退到 `import-<hash>` 伪 uid。
+    """
+    text = str(value if value is not None else "").strip()
+    if not text or len(text) > 64:
+        return ""
+    if text in (".", ".."):
+        return ""
+    if any(ch in text for ch in ("/", "\\", ":", "*", "?", '"', "<", ">", "|")):
+        return ""
+    # 控制字符（含 NUL / 换行）一并拒绝
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return ""
+    return text
+
+
 def _uid_from_access_token(token):
     """从 access token (JWT) 的 data.id 提取真实用户 ID。
 
@@ -2852,6 +2876,9 @@ def _uid_from_access_token(token):
     UserID 会与 refresh token 绑定的用户不一致（上游 20101
     "refresh token user does not match"）。因此优先从 token 里解出
     真实 id；解析失败再退回伪 uid。失败必须静默（导入不能因坏 token 崩）。
+
+    注意：token 来自外部（用户粘贴），`data.id` 不可信 —— 必须经
+    `safe_uid()` 收敛，否则 `../../evil` 会造成落盘路径穿越。
     """
     try:
         parts = str(token or "").split(".")
@@ -2865,8 +2892,7 @@ def _uid_from_access_token(token):
             data = json.loads(data)
         if isinstance(data, dict):
             uid = data.get("id") or data.get("uid") or data.get("user_id")
-            if uid not in (None, ""):
-                return str(uid)
+            return safe_uid(uid)
     except Exception:
         pass
     return ""
@@ -2927,7 +2953,8 @@ def normalise_import_row(row, realm=None):
         detected = detect_realm(host=host, user_region=user_region,
                                 store_region=str(profile.get("storeRegion") or ""))
     cfg = get_realm_config(detected)
-    uid = str(_first_present(row, "uid", "userId", "user_id", default="") or "").strip()
+    # 显式 uid 也来自外部输入，同样要过 safe_uid（防 `../../x` 写入 accounts 之外）
+    uid = safe_uid(_first_present(row, "uid", "userId", "user_id", default=""))
     if not uid:
         # 优先用 token 里的真实用户 ID，否则刷新时 UserID 与 refresh token
         # 归属不匹配（上游 20101）；仅当 token 无法解析时才退回伪 uid。
