@@ -1,3 +1,25 @@
+## [1.7.0-local.3] - 2026-11-19
+
+> 本地补丁版本（非上游）。修复客户端反复报 `Trae SOLO upstream failed: ... SSL: UNEXPECTED_EOF_WHILE_READING ... (502) (4028)`。
+
+### 修复
+
+- **SOLO 路径补传输层重试**：`_handle_agent_solo()` 原本对 `trae_solo_chat()` **零重试**，上游国内域偶发 TLS EOF（实测每次卡满 5 秒后断连）会直接把 502 抛给客户端。现改为按 `TRANSIENT_MAX_RETRIES`（2 次，1s/2s 退避）重放，且仅对 `_is_transient_transport()` 判定为瞬时故障的错误重试（SSL EOF / reset / timeout），业务错误立即返回。重放安全：`_sse_begin()` 在拿到结果后才调用，此时未向客户端写出任何字节。
+- **服务看门狗化**：`service-start.bat` 由「直接执行 pythonw」改为「查端口 → 占用则退出 → 否则后台拉起」，避免 `Stop-ScheduledTask` 杀不掉子进程导致新实例端口冲突、**旧代码静默继续运行**；计划任务增加「每 5 分钟重复触发」触发器，进程挂掉后 5 分钟内自动恢复。
+
+### 诊断结论（记录备查）
+
+- 该错误与前一天的「上下文过大导致超时」是**两类问题**：前者是客户端先超时（网关仍记 200），后者是上游 TLS 层直接断连（网关明确 502）。
+- 上游在 20:43 曾返回 `ServerOverloaded`（耗时 276 秒）、23:23 两次 TLS EOF（各 5 秒），同一分钟后又恢复正常 → 判定为 Trae 服务端晚间高峰不稳定，非本地配置问题。
+- 账号侧无风控：4 个账号均为 `ready`，无 cooldown/breaker。
+
+### 验证
+
+- `_is_transient_transport` 对 `URLError(SSLError(...))` 与裸 `SSLError` 均判定为可重试
+- `_test_trae.py`：`PASS=240 FAIL=0`
+- 守护链路实测：杀进程 → 端口无响应 → 任务触发 → 新 PID 拉起 → `ping 200`；端口占用时触发不会产生第二个实例
+- 重启后请求正常：`DeepSeek-V4-Flash` 1766ms / `MiMo-V2.6-Flash` 1156ms
+
 ## [1.7.0-local.2] - 2026-11-19
 
 > 本地补丁版本（非上游）。承接 `1.7.0-local.1`，补完签到链路的落盘、请求精简与进程托管。

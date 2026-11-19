@@ -77,6 +77,7 @@
 | 4 | 签到结果只在内存，重启即丢 | 看板「积分获取历史」查不到、无法追溯 | `trae_proxy.py` | 功能增强：落盘 activity.jsonl + extra.checkin |
 | 5 | 已签到账号仍会发一次状态查询 | 多一次请求 = 多一分风控面 | `trae_proxy.py` | 优化：本地记录命中则 0 请求跳过 |
 | 6 | 网关进程无守护，会话结束即停 | 需手动启动、无崩溃自愈 | `service-start.bat` + 计划任务 | 运维：登录自启 + 失败重启 |
+| 7 | SOLO 路径遇 TLS 抖动（SSL EOF）一次即失败 | 上游偶发断连直接报 502/4028 给客户端 | `trae_proxy.py` | 稳定性：补传输层重试（1s/2s 退避） |
 
 代码改动统计：`trae_accounts.py` +33 行，`trae_tasks.py` +15/-1 行（共 52 插入、1 删除）。
 
@@ -129,19 +130,31 @@ extra.checkin.at 是今天 且 checked_in=true  →  直接跳过，不发任何
 
 本机 `schtasks.exe` 被安全策略拉黑（`PROGRAM BLOCKED`），改用 PowerShell `Register-ScheduledTask` 注册。
 
-`service-start.bat`（纯 ASCII）：
+`service-start.bat`（纯 ASCII，**看门狗模式**）：
 
 ```bat
 @echo off
+REM - exits immediately if port 8791 is already served (no duplicate instance)
+REM - otherwise launches pythonw hidden with log redirection, then returns
 cd /d D:\phpstudy_pro\WWW\trae2api-hub
-"C:\Users\1\AppData\Local\Programs\Python\Python312\pythonw.exe" trae_proxy.py >> gateway.log 2>&1
+netstat -ano | findstr ":8791" | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 exit /b 0
+start "" /b "C:\Users\1\AppData\Local\Programs\Python\Python312\pythonw.exe" trae_proxy.py >> gateway.log 2>&1
+exit /b 0
 ```
+
+> **为什么是看门狗而不是"直接等进程退出"**：第一版 bat 直接执行 `pythonw`（会等待进程结束），
+> 实测发现两个问题：① `Stop-ScheduledTask` 只杀 `cmd`，`pythonw` 子进程存活 → 新实例端口冲突失败
+> （`LastTaskResult=1`），**旧代码继续运行**，改动静默不生效；② 任务状态在 bat 退出后变 `Ready`，
+> 崩溃不会触发 `RestartOnFailure`。
+> 改为「先查端口 → 占用则退出 → 否则后台拉起」+「每 5 分钟重复触发」后：无重复实例、
+> 挂掉 5 分钟内自动恢复、改代码后杀进程即生效。
 
 任务配置（任务名 `trae2api-hub-gateway`）：
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| 触发器 | AtLogOn（当前用户） | 登录即启动，不需要管理员 |
+| 触发器 | ① AtLogOn（当前用户）② 每 5 分钟重复（`PT5M` / `P3650D`） | 登录启动 + 看门狗巡检 |
 | 运行身份 | `InteractiveToken` + `LeastPrivilege` | 不保存密码，改密码不影响 |
 | 操作 | `service-start.bat`，工作目录=项目根 | `pythonw` 无窗口 + 日志重定向 |
 | 失败重启 | `RestartCount=999`, `Interval=PT1M` | 崩溃后每分钟自动重试 |
@@ -165,6 +178,57 @@ Get-ScheduledTaskInfo -TaskName 'trae2api-hub-gateway'
 
 > 注：`LastTaskResult=267011` 表示「从未运行」，是刚注册时的正常值，不是失败。
 > `NextRunTime` 对 AtLogOn 触发器无确定值（显示为空）也属正常。
+
+### 1.3 Patch 7：SOLO 路径补传输层重试（2026-11-19 深夜故障）
+
+**现象**：客户端报
+
+```
+Trae SOLO upstream failed: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]
+EOF occurred in violation of protocol (_ssl.c:1010)> (HTTP Status: 502) (4028)
+```
+
+网关日志：`request error: ... 5000ms status=502 msg=<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]...>`
+—— 两次都**正好卡在 5 秒**，之后同一账号、同一模型立刻又能正常返回。
+
+**根因**：`_handle_agent_solo()`（`trae_proxy.py`）的调用**没有任何重试**：
+
+```python
+try:
+    result = trae_solo_chat(account, {**payload, "model": model})
+except Exception as exc:
+    return self._error(502, "Trae SOLO upstream failed: %s" % exc, ...)  # 一次抖动即失败
+```
+
+而项目里其实已有现成能力，只是 SOLO 路径没用上：
+
+- `TRANSIENT_MAX_RETRIES = 2`（同账号额外重试 2 次，1s/2s 退避）
+- `_is_transient_transport()` 已覆盖 `ssl.SSLError` / `URLError(SSL)` / reset / timeout，
+  并按字符串匹配 `"SSL: UNEXPECTED_EOF_WHILE_READING"`
+- 信封路径（`aggregate_with_envelope_retry`）早就用上了这两者
+
+**修复**：SOLO 调用改为重试循环，仅对 `_is_transient_transport(exc)` 为真的错误重放，
+业务错误立即返回；重放安全的前提是 `_sse_begin()` 在拿到 `result` 之后才调用（此时尚未向客户端写任何字节）。
+
+```python
+result = None
+for attempt in range(TRANSIENT_MAX_RETRIES + 1):
+    try:
+        result = trae_solo_chat(account, {**payload, "model": model})
+        break
+    except Exception as exc:
+        if attempt >= TRANSIENT_MAX_RETRIES or not _is_transient_transport(exc):
+            record_error(...)
+            return self._error(502, "Trae SOLO upstream failed: %s" % exc, "upstream_error")
+        log("solo 传输层抖动，%.0fs 后重试 %d/%d：%s" % (...), level="WARN", tag="chat")
+        time.sleep(float(attempt + 1))
+```
+
+**效果**：5 秒一次的 TLS 抖动不再直接失败给客户端，最多重试 2 次（1s、2s 退避），
+常见瞬时断连可在第 2 次尝试成功。全部 3 次都失败才返回 502（此时确实是上游不可用）。
+
+**验证**：`_is_transient_transport` 对 `URLError(SSLError(...))` 与裸 `SSLError` 均返回 `True`；
+`_test_trae.py` 240 项通过；重启后 `DeepSeek-V4-Flash` 1766ms、`MiMo-V2.6-Flash` 1156ms 均正常返回。
 
 ---
 

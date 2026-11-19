@@ -10961,12 +10961,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(503, "no CN account available", "server_error")
         started = time.monotonic()
         request_id = uuid.uuid4().hex
-        try:
-            result = trae_solo_chat(account, {**payload, "model": model})
-        except Exception as exc:
-            record_error(model, 502, str(exc)[:200],
+        # SOLO 路径没有信封重试链（aggregate_with_envelope_retry 只覆盖另一条路径），
+        # 上游对国内域偶发 TLS EOF / 连接重置时一次就失败。这里补传输层重试：
+        # 仅重试瞬时故障（_is_transient_transport 覆盖 SSL EOF、reset、timeout），
+        # 业务错误立即抛出。此刻尚未向客户端写出任何字节，重放安全。
+        result = None
+        for attempt in range(TRANSIENT_MAX_RETRIES + 1):
+            try:
+                result = trae_solo_chat(account, {**payload, "model": model})
+                break
+            except Exception as exc:
+                if (attempt >= TRANSIENT_MAX_RETRIES
+                        or not _is_transient_transport(exc)):
+                    record_error(model, 502, str(exc)[:200],
+                                 elapsed_ms=int((time.monotonic()-started)*1000))
+                    return self._error(502, "Trae SOLO upstream failed: %s" % exc,
+                                       "upstream_error")
+                log("solo 传输层抖动，%.0fs 后重试 %d/%d：%s"
+                    % (float(attempt + 1), attempt + 1, TRANSIENT_MAX_RETRIES,
+                       str(exc)[:120]), level="WARN", tag="chat")
+                time.sleep(float(attempt + 1))
+        if result is None:
+            record_error(model, 502, "solo retry exhausted",
                          elapsed_ms=int((time.monotonic()-started)*1000))
-            return self._error(502, "Trae SOLO upstream failed: %s" % exc, "upstream_error")
+            return self._error(502, "Trae SOLO upstream failed: retry exhausted",
+                               "upstream_error")
         record_usage(model, result.get("usage"), stream=bool(payload.get("stream")),
                      elapsed_ms=int((time.monotonic()-started)*1000),
                      account=account.uid, key_id=self._key_id_for_usage(),
