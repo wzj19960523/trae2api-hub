@@ -1,3 +1,37 @@
+## [1.7.0-local.7] - 2026-11-20
+
+> 本地补丁版本（非上游）。**第二轮交叉复核**：专审「1.7.0-local.6 的修复代码是否引入新问题」，四路并行 + 主控独立验证。
+
+### 修复（均为上一轮修复引入的副作用或遗漏）
+
+- **`busy` 被判成任务失败**：`task_daily_checkin` 在拿不到互斥锁时返回 `ok=False`，而 `run_all_tasks` 用 `bool(result.get("ok"))` 汇总 → 整轮巡检被标成「部分失败」，会触发不必要的告警/重试。改为 `ok=True + skipped=True + stats.busy`。
+- **`busy` 时前端展示上一轮结果**：`_run_checkin_job` 的跳过分支只改 `state/error`，`results/ok/total` 仍是上一轮数据，前端只读 `results` → 把旧成果当本轮。现在一并清空。
+- **锁被占用时静默启动空任务**：调度器慢速错峰期间持锁可达数分钟（每账号 45~120s），用户点签到会立刻因拿不到锁退出，只看到「0 个账号」。`/tasks/run` 增加前置检查，直接返回明确原因；前端识别 `ok===false` 并提示。
+- **`energy=null` 但 `credits.remain=0`**：同一份 `/tasks` 响应里两个余额字段自相矛盾。现同步置为 `null`。
+- **「全 0 + 有未知」被误判为全未知**：判据从 `if not energy` 改为「已知账号数为 0」，避免合法归零被当成未知。
+- **「禁用仍签到」在批量路径仍失效**：`/tasks/run`（uid=all）、`trae_scheduler` 巡检、`/accounts/checkin` 三条路径都在循环前按 `enabled` 过滤，勾选账号根本进不去。三处均改为 `enabled or checkin_when_disabled`。
+- **`findstr ":8791 "` 等于没加固**：findstr 把空格当多关键词分隔符，等价于 `":8791"`，仍会误匹配 `87910`。两个 bat 均改用 `/C:":8791 "` 字面量。
+- **`service-stop.bat` 在 cmd 下失效**：文件为 LF 行尾且含中文 REM，`setlocal` 行会被吞掉。改为纯 ASCII + CRLF。
+- **`_first_amount` 跳过真 0**：`if value:` 把「余额确实为 0」当成「没找到」，会继续往后面的 root 找。改用 `_find_key(...) is not None` 判存在性。
+- **前端三处**：签到超时闸门内先补一次状态查询（避免恰好在超时那刻完成的结果被丢弃）；福利中心识别 `ok===false`（避免落进同步分支伪造结果）；`keepDisabled` 标记（避免 `finally` 立刻恢复按钮导致连点产生两条轮询）。
+
+### 新增
+
+- **`_test_review_regressions.py`**：41 项零网络回归测试，覆盖 `safe_uid` 路径穿越/保留名、`_as_float` 的 inf/nan、签到互斥的 busy 语义与异常锁释放、失败不覆盖已签到、`energy`/`credits.remain` 一致性、禁用+勾选真正发起签到。此前这批修复**零测试覆盖**。
+
+### 已知限制（已评估，本轮不改）
+
+- 互斥锁粒度为整批：调度器慢速错峰期间（每账号 45~120s）持锁可达数分钟，手动签到会被拒绝并提示原因。
+- `/accounts/checkin` 旧路径未纳入互斥（前端已改用 `/tasks/run`）。
+- `service-stop.bat` 的 `for /f` 解析无法在本机实测（宿主禁用 cmd.exe），已用 netstat 列位置独立验证 `tokens=5` 取到 PID。
+
+### 验证
+
+- `_test_trae.py`：`PASS=240 FAIL=0`
+- `_test_review_regressions.py`：`PASS=41 FAIL=0`
+- 前端 3 个内联 script 块 `node --check` 全通过
+- 端到端：签到 `total=4`、`energy=4820.61` 与 `credits.remain` 一致、`streak_days=2`（跨天累计）
+
 ## [1.7.0-local.6] - 2026-11-19
 
 > 本地补丁版本（非上游）。**四路对抗性交叉复核**（签到引擎 / 看板数据 / 凭证与网络 / 前后端契约）后修复的问题。

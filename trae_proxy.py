@@ -7392,8 +7392,13 @@ def _run_checkin_job(targets, interval=10.0, jitter=5.0, rng=None, force=False):
         # 与调度器共用签到互斥：已有周期任务在跑时不再并发 claim 同一批账号。
         if not trae_tasks.CHECKIN_MUTEX.acquire(blocking=False):
             with CHECKIN_JOB_LOCK:
+                # 必须把这些字段一起重置：只改 state/error 的话，results/ok/total
+                # 还留着上一轮的数据，前端只读 results → 会把旧结果当成本轮成果展示。
                 CHECKIN_JOB_STATE.update({
                     "state": "done", "finished_at": time.time(),
+                    "total": 0, "done": 0, "ok": 0, "failed": 0,
+                    "skipped": 0, "current": "", "results": [],
+                    "logs": ["— 已有签到任务在运行（调度器），本次跳过"],
                     "error": "已有签到任务在运行（调度器），本次跳过",
                 })
             log("checkin job skipped: another checkin task is running",
@@ -11232,8 +11237,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # 不再按区域过滤：签到能力运行时探测，接口不存在的账号会在
                 # 日志里给出明确原因（历史问题：国际版点签到完全没反应）。
+                # 禁用账号只要勾了「禁用仍签到」也必须进入任务，否则该勾选在
+                # 批量路径（uid=all）上依然无效。
                 targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                           if (a.enabled
+                               or getattr(a, "checkin_when_disabled", False))
+                           and a.access_token]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             # 默认「后台慢速错峰」：逐账号 10s+0~5s 随机间隔执行，避免多账号
@@ -11241,6 +11250,17 @@ class Handler(BaseHTTPRequestHandler):
             # 传 async=false 则退回旧的同步快速批跑（1s 间隔）。
             async_mode = bool(payload.get("async", True))
             if async_mode:
+                # 调度器/巡检线程正在慢速错峰签到时会长时间持 CHECKIN_MUTEX
+                # （每账号 45~120s，多账号可达数分钟）。此时若照常启动任务，
+                # 线程会立刻因拿不到锁而退出，前端只看到「0 个账号」——
+                # 必须提前给出明确原因，而不是伪造一个空任务。
+                _mutex = getattr(trae_tasks, "CHECKIN_MUTEX", None)
+                if _mutex is not None and _mutex.locked():
+                    return self._json(200, {
+                        "ok": False, "async": False, "started": False,
+                        "msg": "调度器正在执行签到（慢速错峰，可能需数分钟），"
+                               "请稍后再试，或直接刷新看板查看进度",
+                    })
                 interval = float(payload.get("interval") or 10.0)
                 jitter = float(payload.get("jitter") if payload.get("jitter") is not None else 5.0)
                 started, state = start_checkin_job(
@@ -11322,7 +11342,10 @@ class Handler(BaseHTTPRequestHandler):
             for account in targets:
                 if account is None:
                     continue
-                if not account.enabled or not account.access_token:
+                # 禁用账号默认跳过；勾了「禁用仍签到」时继续（与后台任务/调度器一致）
+                if (not account.enabled
+                        and not getattr(account, "checkin_when_disabled", False)) \
+                        or not account.access_token:
                     continue            # 跳过的账号不占用防风控等待
                 if last_at is not None:
                     # 账号之间保持 >= CHECKIN_MIN_GAP（与 trae_tasks.py 声明的

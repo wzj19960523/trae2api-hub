@@ -594,3 +594,32 @@ def _resolve_credits(account, snapshot=None):
 
 **复核后验证**：`PASS=240 FAIL=0`；4 账号签到 `4/4 ok=true`；`energy=4820.61`、`streak_days=1`；
 `checkedInToday` 全 true；前端 3 个 script 块 `node --check` 全通过。
+
+### 1.7 Patch 11：第二轮交叉复核（专审「修复是否引入新问题」）
+
+**方法**：代码冻结在 `75f6383` 后派四路（签到引擎 / 安全与数值 / 前端与脚本 / 跨文件回归），
+每路 prompt 明确「目标是找出修复引入的新问题」并要求给 `文件:行号`；主控独立复核并亲跑命令。
+
+| # | 来源 | 级别 | 问题 | 与哪项修复相关 | 处置 |
+|---|---|---|---|---|---|
+| 1 | S4 | P1 | `busy` 返回 `ok=False` → `run_all_tasks` 把整轮巡检标记「部分失败」 | D 互斥 | 改 `ok=True+skipped=True+stats.busy` |
+| 2 | S1/S4 | P1 | `busy` 时只改 `state/error`，`results/ok/total` 保留上一轮 → 前端展示旧成果 | D 互斥 | 一并清空 |
+| 3 | S1 | P1 | 锁被调度器持有时（数分钟），用户点签到静默启动空任务显示「0 个账号」 | D 互斥 | `/tasks/run` 前置检查 + 前端识别 `ok===false` |
+| 4 | S2/S4 | P1 | `energy=null` 但 `credits.remain=0`，同一响应自相矛盾 | I 全未知 | 同步置 null |
+| 5 | S2/S4 | P2 | `if not energy` 把「全 0 + 有未知」误判为全未知 | I | 改用「已知账号数为 0」 |
+| 6 | S1/S4 | P2 | 「禁用仍签到」在 `/tasks/run`(uid=all)、调度器巡检、`/accounts/checkin` 三条路径仍失效 | C 禁用分支 | 三处改为 `enabled or checkin_when_disabled` |
+| 7 | S3 | **P1** | `findstr ":8791 "` 的空格被当多关键词分隔符，等价 `":8791"`，仍误匹配 87910 | N 端口匹配 | 两个 bat 改 `/C:":8791 "` |
+| 8 | S3 | P2 | `service-stop.bat` 为 LF 行尾 + 中文 REM，`setlocal` 行被吞 | N | 纯 ASCII + CRLF |
+| 9 | S2 | P2 | `_first_amount` 用 `if value:` 跳过真 0 | O 数值 | 改 `_find_key(...) is not None` |
+| 10 | S3 | P2 | 超时闸门在 `done` 判定之前，恰在超时那刻完成的结果被丢弃 | L 轮询 | 闸门内补查一次状态 |
+| 11 | S3 | P2 | 福利中心 `async:false` 误落同步分支伪造结果 | K | 识别 `ok===false` 提前返回 |
+| 12 | S3 | P2 | `finally` 立刻恢复按钮 → 连点产生两条轮询 | K | `keepDisabled` 交给轮询收尾 |
+| 13 | S4 | P2 | 本轮修复零回归测试 | — | 新增 `_test_review_regressions.py`（41 项） |
+
+**冲突裁定**：S2 报「`energy_note` 前端不可达（6341 title 先判 unknownUids）」，S4 报「可达（6337-6341）」。
+主控直读 `dashboard.html` 确认：`lblNrg.title` 的三元链首判 `unknownUids.length`，
+**归零但无未知项时 note 确实不展示** —— 采信 S2，但该场景下 note 是「合计仅包含 N 个账号」的解释文案，
+前端已有「已排除 N 个未知账号」标题覆盖同一信息，故不改（记录为可接受）。
+
+**流程**：本轮同样出现基线漂移（主控在子进程运行期间修代码）。已确认这几处改动均由子进程报告触发，
+最终以**工作区实际代码**为准重新跑全部测试，不依赖子进程对行号的引用。

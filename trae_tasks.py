@@ -1047,12 +1047,18 @@ def _find_amount(obj, names):
 
 
 def _first_amount(roots, names):
+    """按顺序找第一个**存在**的金额字段。
+
+    不能用 `if value:` 判空 —— 真余额 0（额度用尽）会被当成"没找到"而继续
+    往后面的 root 找，可能顶出一个更旧/错误的数值。`_find_key` 返回 None
+    才代表字段缺失。
+    """
     for root in roots:
         if root is None:
             continue
-        value = _find_amount(root, names)
-        if value:
-            return value
+        raw = _find_key(root, names)
+        if raw is not None:
+            return _as_float(raw)
     return 0.0
 
 
@@ -1566,7 +1572,10 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
     上报，而不是排队后再对同一账号重复请求。
     """
     if not CHECKIN_MUTEX.acquire(blocking=False):
-        return {"ok": False, "task": "daily_checkin",
+        # ok=True + skipped=True：busy 是**正常**状态（另一个签到任务正在跑），
+        # 不能返回 ok=False —— run_all_tasks 会把整轮巡检标记成「部分失败」，
+        # 进而触发不必要的告警/重试。
+        return {"ok": True, "skipped": True, "task": "daily_checkin",
                 "summary": "已有签到任务在运行，本次跳过",
                 "stats": {"checked": 0, "already": 0, "failed": 0,
                           "skipped": 0, "earned_credit": 0, "busy": True},
@@ -2590,18 +2599,20 @@ def _build_summary(accounts, state, mode=None, realm=None):
     }
     if unknown_uids:
         summary["credits_unknown_accounts"] = unknown_uids
-        # 「未知 ≠ 0」对两种视图都成立：单账号视图保留原契约；批量视图若
-        # **一个账号都没拿到余额**（energy 仍为 0），合计同样不可知 ——
-        # 直接报 0 会让用户以为额度耗尽（issue #25 的原症状）。
-        if not energy:
+        # 「未知 ≠ 0」对两种视图都成立：**所有账号都拿不到余额**时合计不可知；
+        # 只要有账号拿到余额，就按已知口径给出合计并注明排除数。
+        known_count = len(accounts) - len(unknown_uids)
+        if known_count <= 0:
             summary["energy"] = None
+            # 必须同步：否则 energy=null 而 credits.remain 仍是 0，同一份响应
+            # 里两个余额字段自相矛盾（前端若读 credits.remain 会显示 0）。
+            summary["credits"] = {"remain": None}
             summary["credits_unknown"] = True
             summary["energy_note"] = ("余额未知（上游未提供余额字段或刷新失败，"
                                       "等待下次成功刷新）")
         else:
             summary["energy_note"] = ("合计仅包含 %d 个账号；%d 个账号余额未知未计入"
-                                      % (len(accounts) - len(unknown_uids),
-                                         len(unknown_uids)))
+                                      % (known_count, len(unknown_uids)))
     return summary
 
 

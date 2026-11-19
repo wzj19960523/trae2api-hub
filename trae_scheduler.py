@@ -497,8 +497,12 @@ class Scheduler(object):
                                              time.localtime(started))
         self.last_cycle_kind = cycle_kind
         self.log("开始执行维护巡检 (%s)..." % trigger_reason)
+        # 勾了「禁用仍签到」的账号也要进入巡检：否则该勾选在调度器路径上
+        # 依旧无效（账号在这里就被过滤掉了）。这类账号同时参与保活/用量
+        # 刷新，对避免 token 过期是有益的。
         accounts = [a for a in (getattr(self.pool, "accounts", []) or [])
-                    if getattr(a, "enabled", True)
+                    if (getattr(a, "enabled", True)
+                        or getattr(a, "checkin_when_disabled", False))
                     and trae_tasks._access_token(a)]
         if not accounts:
             self.log("暂无可用的活跃账号，跳过本次巡检")

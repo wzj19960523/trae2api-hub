@@ -7118,6 +7118,13 @@ async function doCheckin(btn){
   try {
     // 后台慢速错峰签到（10s+0~5s 抖动），接口立即返回，轮询状态
     const r = await postJSON("/tasks/run", {async:true});
+    // 后端明确拒绝（调度器正在签到 / 无可用账号）：直接告知原因，不要进轮询，
+    // 否则前端会把上一轮残留的 results 当成本轮结果展示。
+    if(r && r.ok === false){
+      toast(r.msg || "签到任务启动失败", "warn");
+      btn.disabled = false; btn.textContent = ot;
+      return;
+    }
     if(!r || r.async){
       const job = (r && r.job) || {state:"starting"};
       toast((r && r.msg) || "后台签到任务已启动（10s+0~5s 错峰）", "ok");
@@ -7133,7 +7140,19 @@ async function doCheckin(btn){
         // 超时闸门放在 try 之外：轮询请求本身失败（网关重启/401）时也必须能收尾，
         // 否则按钮永久禁用、timer 永不清理。
         if(Date.now() - t0 > HARD_TIMEOUT_MS){
-          clearInterval(poll); btn.disabled = false; btn.textContent = ot;
+          clearInterval(poll);
+          // 收尾前再查一次：任务可能恰好在超时这一刻完成，不能把结果丢掉
+          try{
+            const s2 = await postJSON("/tasks/checkin-job", {});
+            if(s2.state === "done" || s2.state === "idle"){
+              const rows2 = (s2.results || []).map(checkinOutcome);
+              if(rows2.length) toast("每日签到: " + checkinToastText(rows2), checkinToastKind(rows2));
+              await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
+              btn.disabled = false; btn.textContent = ot;
+              return;
+            }
+          }catch(e2){}
+          btn.disabled = false; btn.textContent = ot;
           toast("签到仍在后台进行，可刷新查看", "warn");
           return;
         }
@@ -8443,6 +8462,9 @@ async function runGrowthTasks(btn){
   btn.disabled = true;
   const oldText = btn.textContent;
   btn.textContent = '领取中...';
+  // async 分支把按钮的恢复交给轮询收尾：否则 finally 立刻恢复按钮，
+  // 任务还在跑时用户可以再点，产生两条并存的轮询与重复 toast。
+  let keepDisabled = false;
   const logBox = document.getElementById("taskLogBox");
   if(logBox){
     logBox.style.display = 'block';
@@ -8456,7 +8478,14 @@ async function runGrowthTasks(btn){
     // 必须带上 payload（账号过滤）：早前直接传 {async:true} 会把 uid 丢掉，
     // 导致「对单个账号领取」实际作用于全部账号。
     const r = await postJSON("/tasks/run", Object.assign({}, payload, {async:true}));
+    // 后端明确拒绝（调度器正在签到 / 无可用账号）：不要落进同步分支伪造结果
+    if(r && r.ok === false && r.async !== true){
+      toast(r.msg || "领取请求被拒绝", "warn");
+      if(logBox) logBox.innerHTML = '<div style="color:var(--warn)">' + esc(r.msg || '领取请求被拒绝') + '</div>';
+      return;
+    }
     if(r && r.async){
+      keepDisabled = true;      // 交给轮询收尾恢复按钮
       // 后台错峰签到：立即提示，轮询进度
       toast((r.msg) || "后台签到已启动（10s+0~5s 错峰）", "ok");
       if(logBox){
@@ -8522,8 +8551,12 @@ async function runGrowthTasks(btn){
     if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
     toast("任务执行失败: " + e.message, "bad");
   }finally{
-    btn.disabled = false;
-    btn.textContent = oldText;
+    // async 分支（keepDisabled=true）由轮询完成后自行恢复按钮，
+    // 否则任务还在后台跑时按钮已可点，会起第二条轮询。
+    if(!keepDisabled){
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
   }
 }
 

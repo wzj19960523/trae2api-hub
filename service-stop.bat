@@ -1,11 +1,12 @@
 @echo off
-REM trae2api-hub gateway STOP helper (ASCII only)
-REM 说明：任务计划程序的「结束」只会结束 bat/任务实例，不会杀掉它拉起的
-REM pythonw 子进程；需要显式按端口结束监听者。停完后看门狗会在 5 分钟内
-REM 重新拉起网关（如需长期停机，请先禁用计划任务 trae2api-hub-gateway）。
+REM trae2api-hub gateway STOP helper (ASCII only, CRLF)
+REM Note: Task Scheduler "End" only ends the task instance, it does NOT kill
+REM the pythonw child it spawned. Kill the listener by port explicitly.
+REM The watchdog restarts the gateway within 5 minutes; disable task
+REM trae2api-hub-gateway first if you need a long-term stop.
 setlocal enabledelayedexpansion
 set FOUND=0
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":8791 " ^| findstr "LISTENING"') do (
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr /C:":8791 " ^| findstr "LISTENING"') do (
   echo killing gateway PID %%p
   taskkill /PID %%p /F >nul 2>&1
   set FOUND=1

@@ -2845,6 +2845,13 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
     }
 
 
+_WIN_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
 def safe_uid(value):
     """把外部来源（JWT / 用户输入）的 uid 收敛成可安全落盘的标识。
 
@@ -2853,13 +2860,20 @@ def safe_uid(value):
     等于可被构造的路径穿越）。这里做白名单式收敛：
       - 长度 1~64；
       - 不含路径分隔符与 Windows 非法文件名字符；
-      - 不是 "." / ".."。
+      - 不是 "." / ".."，不以点或空格结尾（Windows 会静默去掉尾部点/空格，
+        导致 `evil.` 与 `evil` 指向同一文件、甚至退化成空名）；
+      - 不是 Windows 设备保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9），
+        这类名字无法作为普通文件名创建。
     不合规一律返回空串，由调用方回退到 `import-<hash>` 伪 uid。
     """
     text = str(value if value is not None else "").strip()
     if not text or len(text) > 64:
         return ""
     if text in (".", ".."):
+        return ""
+    if text.endswith((".", " ")):
+        return ""
+    if text.split(".")[0].upper() in _WIN_RESERVED_NAMES:
         return ""
     if any(ch in text for ch in ("/", "\\", ":", "*", "?", '"', "<", ">", "|")):
         return ""
