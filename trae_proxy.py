@@ -1824,6 +1824,13 @@ def _usage_by_account_uncached(since=None, until=None):
     out = sorted(buckets.values(), key=lambda b: -b["total_tokens"])
     for item in out:
         item["models"] = sorted(item["models"].items(), key=lambda kv: -kv[1])[:5]
+        # 前端 /accounts 拿到的是**掩码 uid**（…6800），而这里按完整 uid 聚合；
+        # 只给 account 字段时前端用掩码查永远匹配不上 → 「请求/总TOKEN/缓存」三列恒 0。
+        # 附带不可逆 uidHash，前端改用 hash 索引即可对上。
+        try:
+            item["uidHash"] = trae_accounts.uid_digest(item.get("account") or "")
+        except Exception:
+            item["uidHash"] = ""
     return out
 
 

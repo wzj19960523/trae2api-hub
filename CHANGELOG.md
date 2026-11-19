@@ -1,3 +1,24 @@
+## [1.7.0-local.5] - 2026-11-19
+
+> 本地补丁版本（非上游）。修复看板四个区域显示异常：今日签到徽标、积分合计、连续签到天数、请求/TOKEN/缓存列。
+
+### 修复
+
+- **「今日未签到」徽标永远不亮**：前端读 `a.checkedInToday` / `a.lastCheckinDate`，但 `Account.public()` 从未输出这两个字段。现从 `extra.checkin` 派生：`checkedInToday = checked_in && at 是今天`，另给 `lastCheckinDate`。
+- **积分合计恒为 0 且提示「已排除 4 个未知账号」**：两处叠加问题。
+  ① `_digest_entitlement` 查找键是 `balance`，而真实 pay 结构把余额放在 **`ent_usage.total_balance`**（归一化 `totalbalance`），匹配不到 → `remain=0` → `quota_known=False` → 被判「未知」不计入合计。现已补 `totalbalance`，并在缺失时用 `total_amount - consumed_amount` 兜底。
+  ② `fetch_tasks_view` 优先用历史快照的 `credits`（旧解析逻辑写入，quota_known=False）。现改为 `_resolve_credits()`：**优先按账号当前 entitlement 实时计算**，快照仅作兜底。
+- **余额被 int 截断**：`_find_number` 内部 `_as_int` 把 `597.56` 截成 `597`，合计与账号卡片对不上账。新增 `_as_float` / `_find_amount` / `_first_amount` 金额专用路径，`energy` 累加与输出同样保留两位小数。
+- **「连续签到 0 天」**：`summary["streak_days"]` 原为**硬编码 0**。新增 `_checkin_streak()`，按 `usage/activity.jsonl` 里 `kind=checkin && ok` 的日期集合回溯计算（上限 400 天防死循环）。
+- **请求 / 总 TOKEN / 缓存三列恒 0**：前端用 `/accounts` 的**掩码 uid**（`…6800`）查 `USAGE_BY_ACCOUNT`，而后端按**完整 uid** 聚合 → key 永不匹配。现 `/usage/by-account` 每行附带不可逆 `uidHash`，前端以 `uidHash` 为主键索引、掩码 uid 作兼容回退。
+
+### 验证
+
+- `/accounts`：4 个账号 `checkedInToday=true`、`lastCheckinDate=2026-11-19`
+- `/tasks?realm=cn`：`energy=4820.61`（2254.38+597.56+411.37+1557.3）、`streak_days=1`、无 `credits_unknown_accounts`
+- `/usage/by-account`：每行均带 `uidHash`，请求数与 token 数与日志一致
+- `_test_trae.py`：`PASS=240 FAIL=0`
+
 ## [1.7.0-local.4] - 2026-11-19
 
 > 本地补丁版本（非上游）。修复签到偶发显示「签到未生效：success」。

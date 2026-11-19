@@ -1699,6 +1699,13 @@ class Account(object):
         token_info = redact_token(self.token)
         refresh_info = redact_token(self.refresh_token)
         profile = self.account or {}
+        # 今日签到状态：dashboard 的「今日已/未签到」徽标读 checkedInToday
+        # 与 lastCheckinDate。此前 public() 从不输出这两个字段，导致徽标
+        # 永远显示「今日未签到」。
+        _ck = (self.extra or {}).get("checkin") or {}
+        _ck_at = str(_ck.get("at") or "")
+        _ck_today = (bool(_ck.get("checked_in"))
+                     and _ck_at.startswith(time.strftime("%Y-%m-%d")))
         return {
             # uid 只露后 4 位；uidHash 供接口定位，不可逆
             "uid": mask_uid(self.uid),
@@ -1712,6 +1719,8 @@ class Account(object):
             "proxySource": self.proxy_source,
             "enabled": bool(self.enabled),
             "checkinWhenDisabled": bool(getattr(self, "checkin_when_disabled", False)),
+            "checkedInToday": bool(_ck_today),
+            "lastCheckinDate": _ck_at[:10],
             "status": self.status(now=now),
             "weight": self.weight,
             "disabledModels": list(self.disabled_models),

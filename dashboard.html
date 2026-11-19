@@ -4788,7 +4788,7 @@ async function adminRenderOverview(){
   const list=window.ACCOUNTS||[];
   const n=v=>v==null?'—':fmt(v);
   const totalTokens=u=>u.total_tokens??u.tokens;
-  const max=Math.max(1,...list.map(a=>Number(totalTokens(USAGE_BY_ACCOUNT[a.uid]||{}))||0));
+  const max=Math.max(1,...list.map(a=>Number(totalTokens((USAGE_BY_ACCOUNT[a.uidHash]||USAGE_BY_ACCOUNT[a.uid]||{})))||0));
   box.innerHTML=list.length?'<table><thead><tr><th>账号 / 分组</th><th>状态</th><th>剩余积分</th><th>累计请求</th><th>累计 Token</th><th style="width:24%">Token 相对占比</th></tr></thead><tbody>'+list.map(a=>{
     const u=USAGE_BY_ACCOUNT[a.uid]||{},v=totalTokens(u);const state=!a.enabled?'停用':a.inCooldown?'冷却':a.expiresIn==='expired'?'过期':a.lastError?'有错误记录':'已启用';
     return '<tr><td><b>'+esc(a.nickname||a.uid)+'</b><div class="hint" style="margin:0">'+esc(a.group||'未分组')+' · '+esc(a.realm||'intl')+'</div></td><td>'+esc(state)+'</td><td>'+n(a.credits&&a.credits.remain)+'</td><td>'+n(u.requests)+'</td><td>'+n(v)+'</td><td><span class="bar-fill" style="width:'+(v==null?0:Math.max(0,Number(v)/max*100))+'%;min-width:0"></span></td></tr>';
@@ -7415,7 +7415,7 @@ function accountRow(a){
   // JWT; treat it as untrusted and keep it to a safe charset.
   const uidAttr = esc(String(a.uid || '').replace(/[^\w.@-]/g, ''));
   const nameAttr = esc(String(a.nickname || '').replace(/["'\\<>]/g, ''));
-  const usage = USAGE_BY_ACCOUNT[a.uid] || {};
+  const usage = (USAGE_BY_ACCOUNT[a.uidHash] || USAGE_BY_ACCOUNT[a.uid] || {});
   const _ckOff = (!a.enabled)
     ? '<label class="ck-when-off" title="issue #102：禁用只表示不接推理流量，勾上后该账号仍参与每日签到/领福利">'
       + '<input type="checkbox" ' + (a.checkinWhenDisabled ? 'checked' : '') +
@@ -7587,7 +7587,7 @@ function accountQuota(cred){
 }
 
 function acctSortValue(a, key){
-  const usage = USAGE_BY_ACCOUNT[a.uid] || {};
+  const usage = (USAGE_BY_ACCOUNT[a.uidHash] || USAGE_BY_ACCOUNT[a.uid] || {});
   switch(key){
     case "realm":    return a.realm === "cn" ? 0 : 1;
     case "name":     return String(a.nickname || a.uid || "").trim();
@@ -7703,7 +7703,12 @@ async function loadAccounts(){
     const [acct, byAcct] = await Promise.all([getJSON('/accounts?realm=all'), getJSON('/usage/by-account')]);
     window.ACCOUNTS = acct.accounts || [];
     USAGE_BY_ACCOUNT = {};
-    (byAcct.accounts || []).forEach(a => { USAGE_BY_ACCOUNT[a.account] = a; });
+    (byAcct.accounts || []).forEach(a => {
+      USAGE_BY_ACCOUNT[a.account] = a;
+      // /accounts 返回的是掩码 uid（…6800），用量按完整 uid 聚合；
+      // 额外用 uidHash 建索引，避免「请求/总TOKEN/缓存」因 key 不匹配恒为 0。
+      if(a.uidHash) USAGE_BY_ACCOUNT[a.uidHash] = a;
+    });
     renderAccounts();
     adminSyncGroups(); adminRenderOverview();
     updateUI();

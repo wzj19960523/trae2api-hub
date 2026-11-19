@@ -753,8 +753,17 @@ def _credits_from_entitlement(source, account):
     if not digest.get("ok"):
         return None
     updated = int(getattr(account, "usage_updated_at", 0) or 0)
-    remain = int(digest.get("remain") or 0)
-    total = int(digest.get("total") or 0)
+
+    def _amount(value):
+        """余额/总量保留两位小数：pay 结构是小数（如 597.56），
+        int() 截断会让合计与账号卡片对不上账。"""
+        try:
+            return round(float(value or 0), 2)
+        except (TypeError, ValueError):
+            return 0
+
+    remain = _amount(digest.get("remain"))
+    total = _amount(digest.get("total"))
     return {
         "ok": True,
         # 真实 pay 结构没有「余额」字段：不要把缺失当 0 展示/累加
@@ -770,6 +779,51 @@ def _credits_from_entitlement(source, account):
         "plan": digest.get("plan") or "",
         "trial": digest.get("trial") or {},
     }
+
+
+def _checkin_streak(days=None):
+    """连续签到天数（含今天）：按 usage/activity.jsonl 里 kind=checkin 的日期统计。
+
+    此前 summary["streak_days"] 是硬编码 0，看板永远显示「0 天」。
+    数据源是后台签到任务写入的流水（Patch 4）；当天多条记录按日期去重。
+    无历史时返回 0，今天签过返回 1，连着两天返回 2。
+    """
+    if days is None:
+        days = set()
+        path = os.path.join(usage_dir() or "", "activity.jsonl")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(row.get("kind") or "") != "checkin":
+                        continue
+                    if not row.get("ok"):
+                        continue
+                    try:
+                        ts = float(row.get("ts") or 0)
+                    except (TypeError, ValueError):
+                        ts = 0
+                    if ts:
+                        days.add(time.strftime("%Y-%m-%d",
+                                               time.localtime(ts)))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    streak = 0
+    now = time.time()
+    for i in range(400):                      # 上限约一年，防死循环
+        day = time.strftime("%Y-%m-%d", time.localtime(now - i * 86400))
+        if day not in days:
+            break
+        streak += 1
+    return streak
 
 
 def _credits_digest(account):
@@ -830,12 +884,37 @@ def _as_int(value):
         return 0
 
 
+def _credits_usable(credits):
+    """额度摘要是否可用于展示/累加（未知 ≠ 0）。"""
+    return bool(credits) and not (
+        credits.get("unknown")
+        or credits.get("quota_known") is False
+        or not credits.get("ok"))
+
+
+def _resolve_credits(account, snapshot=None):
+    """额度来源：优先按账号当前 entitlement/usage 实时计算，其次历史快照。
+
+    历史快照可能是旧解析逻辑写入的（缺 total_balance → quota_known=False、
+    remain=0）。若直接优先用快照，看板会把全部账号判成「未知」、合计显示 0，
+    并提示「已排除 N 个未知账号」。
+    """
+    snapshot = snapshot or {}
+    fresh = _credits_digest(account)
+    if _credits_usable(fresh):
+        return fresh
+    snap = snapshot.get("credits") or {}
+    if _credits_usable(snap):
+        return snap
+    return fresh
+
+
 def _account_brief(account, snapshot=None):
     snapshot = snapshot or {}
     now = time.time()
     expires = _expires_at(account)
     refresh_expires = _refresh_expires_at(account)
-    credits = snapshot.get("credits") or _credits_digest(account)
+    credits = _resolve_credits(account, snapshot)
     usage = snapshot.get("usage") or None
     if not usage:
         stored_usage = getattr(account, "usage", None)
@@ -935,6 +1014,33 @@ def _find_key(obj, names, depth=3):
 
 def _find_number(obj, names):
     return _as_int(_find_key(obj, names))
+
+
+def _as_float(value):
+    """金额专用：保留两位小数（余额 597.56 不能被 int 截成 597）。"""
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+    try:
+        return round(float(str(value).strip()), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _find_amount(obj, names):
+    """在对象里找第一个金额字段（不截断小数）。"""
+    return _as_float(_find_key(obj, names))
+
+
+def _first_amount(roots, names):
+    for root in roots:
+        if root is None:
+            continue
+        value = _find_amount(root, names)
+        if value:
+            return value
+    return 0.0
 
 
 def _find_bool(obj, names):
@@ -1153,10 +1259,21 @@ def _digest_entitlement(payload, source=""):
                 if normalized:
                     normalized["name"] = normalized["name"] or str(key)[:80]
                     benefits.append(normalized)
-    remain = _first_number(roots, ("remain", "remaining", "balance",
-                                   "credits", "credit", "quota_remain"))
-    total = _first_number(roots, ("total", "size", "quota", "total_quota",
-                                  "limit"))
+    remain = _first_amount(roots, ("remain", "remaining", "balance",
+                                   "credits", "credit", "quota_remain",
+                                   # 真实 pay 结构把余额放在 total_balance
+                                   # （ent_usage.total_balance），归一化后是
+                                   # totalbalance；漏掉它会让所有账号被判
+                                   # 「quota_known=False → 未知」而不计入合计。
+                                   "totalbalance"))
+    total = _first_amount(roots, ("total", "size", "quota", "total_quota",
+                                  "limit", "totalamount"))
+    if not remain and total:
+        # 部分账号只给 total_amount + consumed_amount（没有 total_balance）
+        consumed = _first_amount(roots, ("consumedamount", "usedamount",
+                                         "consumed", "used"))
+        if consumed:
+            remain = max(0, total - consumed)
     if not remain and benefits:
         remain = sum(b["remain"] for b in benefits)
     if not total and benefits:
@@ -2177,7 +2294,7 @@ def _describe_usage(record, accounts, snapshots):
     tokens = 0
     for account in accounts:
         snapshot = snapshots.get(_uid_of(account)) or {}
-        credits = snapshot.get("credits") or _credits_digest(account)
+        credits = _resolve_credits(account, snapshot)
         if (credits.get("unknown") or credits.get("quota_known") is False
                 or not credits.get("ok")):
             unknown += 1
@@ -2347,12 +2464,16 @@ def _build_summary(accounts, state, mode=None, realm=None):
     for account in accounts:
         uid = _uid_of(account)
         snapshot = snapshots.get(uid) or {}
-        credits = snapshot.get("credits") or _credits_digest(account)
+        credits = _resolve_credits(account, snapshot)
         if (credits.get("unknown") or credits.get("quota_known") is False
                 or not credits.get("ok")):
             unknown_uids.append(uid)
         else:
-            energy += int(credits.get("remain") or 0)
+            try:
+                # 余额是小数（如 597.56）：int() 会让合计与账号卡片对不上账
+                energy += float(credits.get("remain") or 0)
+            except (TypeError, ValueError):
+                pass
         usage = snapshot.get("usage") or {}
         if not usage:
             stored_usage = getattr(account, "usage", None)
@@ -2392,8 +2513,8 @@ def _build_summary(accounts, state, mode=None, realm=None):
         "mode": mode,
         "realm": realm or "",
         "accounts_total": len(accounts),
-        "energy": energy,
-        "streak_days": 0,
+        "energy": round(energy, 2),
+        "streak_days": _checkin_streak(),
         "plan": "全部账号" if mode == "all" else (
             str(getattr(accounts[0], "plan", "") or "-") if accounts else "-"),
         "credits": {"remain": energy},

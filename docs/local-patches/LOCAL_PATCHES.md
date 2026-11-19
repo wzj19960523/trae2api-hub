@@ -79,6 +79,7 @@
 | 6 | 网关进程无守护，会话结束即停 | 需手动启动、无崩溃自愈 | `service-start.bat` + 计划任务 | 运维：登录自启 + 失败重启 |
 | 7 | SOLO 路径遇 TLS 抖动（SSL EOF）一次即失败 | 上游偶发断连直接报 502/4028 给客户端 | `trae_proxy.py` | 稳定性：补传输层重试（1s/2s 退避） |
 | 8 | 签到成功后状态查询过早，被误判为失败 | 看板显示「签到未生效：success」自相矛盾 | `trae_client.py` | 修复：状态未刷新时重试查询 |
+| 9 | 看板四区显示异常（签到徽标/积分合计/连续天数/用量列） | 数据明明存在却显示 0 或「未签到」 | `trae_accounts.py`、`trae_tasks.py`、`trae_proxy.py`、`dashboard.html` | 修复：字段补全 + 取键纠错 + 主键对齐 |
 
 代码改动统计：`trae_accounts.py` +33 行，`trae_tasks.py` +15/-1 行（共 52 插入、1 删除）。
 
@@ -514,3 +515,47 @@ cp accounts/import-3f9e96a96c14ba8a70a0.json.bak-uidfix \
 
 已在 fork 上创建 `local` 分支，可直接用 GitHub 的对比页面向上游发起 PR：
 `https://github.com/wzj19960523/trae2api-hub/pull/new/local`
+
+### 1.5 Patch 9：看板四区显示异常（字段缺失 / 取键错误 / 主键不匹配）
+
+**现象**：账号列表 4 行全部显示「今日未签到」；积分合计 0 且提示「已排除 4 个未知账号」；
+连续签到 0 天；「请求 / 总 TOKEN / 缓存」三列恒为 0。而账号卡片上的余额（2254.38 等）与
+签到记录其实都存在。
+
+**四处独立缺陷**（各自都会单独造成显示异常）：
+
+| # | 缺陷 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 签到徽标永远「未签到」 | 前端读 `a.checkedInToday`/`a.lastCheckinDate`，`Account.public()` **从未输出** | `public()` 从 `extra.checkin` 派生两字段 |
+| 2 | 积分合计 0 + 「排除 4 个未知账号」 | `_digest_entitlement` 找 `balance`，真实字段是 `ent_usage.total_balance`（归一化 `totalbalance`）→ 取不到 → `quota_known=False` → 判未知 | 补 `totalbalance`；缺失时用 `total_amount - consumed_amount` 兜底 |
+| 3 | 合计与明细对不上 / 小数丢失 | `_find_number` 内部 `_as_int` 把 `597.56` 截成 `597` | 新增 `_as_float`/`_find_amount`/`_first_amount` 金额专用路径 |
+| 4 | 用量三列恒 0 | 前端用**掩码 uid**（`…6800`）查 `USAGE_BY_ACCOUNT`，后端按**完整 uid** 聚合 | `/usage/by-account` 附带 `uidHash`，前端改用 hash 索引 |
+
+另外 `summary["streak_days"]` 原为**硬编码 0**，新增 `_checkin_streak()` 按
+`usage/activity.jsonl`（`kind=checkin && ok`）的日期集合回溯（上限 400 天）。
+
+**关键教训：历史快照可能是旧解析逻辑的产物**
+
+`fetch_tasks_view` 原本 `credits = snapshot.get("credits") or _credits_digest(account)` ——
+优先用快照。快照是旧代码写入的（`quota_known=False`），即使解析逻辑修好了，
+只要快照还在，看板依旧全判未知。现改为 `_resolve_credits()`：**实时算优先、快照兜底**：
+
+```python
+def _resolve_credits(account, snapshot=None):
+    fresh = _credits_digest(account)
+    if _credits_usable(fresh):
+        return fresh
+    snap = (snapshot or {}).get("credits") or {}
+    if _credits_usable(snap):
+        return snap
+    return fresh
+```
+
+**验证**
+
+| 接口 | 结果 |
+|---|---|
+| `/accounts?realm=all` | 4 个账号 `checkedInToday=true`、`lastCheckinDate=2026-11-19` |
+| `/tasks?realm=cn` | `energy=4820.61`（2254.38+597.56+411.37+1557.3）、`streak_days=1`、无 `credits_unknown_accounts` |
+| `/usage/by-account` | 每行带 `uidHash`，`requests`/`total_tokens` 与日志一致 |
+| `_test_trae.py` | `PASS=240 FAIL=0` |
