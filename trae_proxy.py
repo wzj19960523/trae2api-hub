@@ -6362,7 +6362,16 @@ def trae_solo_chat(account, payload, timeout=180):
     content = "".join(text_parts)
     tool_calls = _solo_tool_calls(tool_slots)
     if not content and not tool_calls:
-        raise RuntimeError("solo returned empty content")
+        # 上游返回 HTTP200 + 空 SSE 流（无任何 response/reasoning/tool 帧）：
+        # 没有生成任何 token，通常也没计费，属于「这个号此刻不可用」的静默
+        # 版本（与 4008 同类）。挂标记让上层换号重试；但若收到了推理帧
+        # （reasoning_parts 非空）则说明上游已生成过内容，不能重放。
+        exc = RuntimeError("solo returned empty content")
+        try:
+            exc.solo_empty = not bool(reasoning_parts)
+        except Exception:
+            pass
+        raise exc
     if tool_calls:
         # 上游若在工具调用没走完就结束（长度截断 / 内容过滤 / 其它失败终止），
         # 这些 tool_calls 不可执行，不能包装成 finish_reason=tool_calls 给下游。
@@ -7641,11 +7650,17 @@ def _is_transient_upstream(code, detail):
 
 
 def _solo_quota_exhausted(exc):
-    """是否是「该账号 SOLO 通道配额耗尽」的业务错误（上游 4008）。
+    """是否是「该账号此刻不可用，换号有意义」的错误。
 
-    这类错误与账号绑定：同一请求换一个账号通常就能成功。因此调用方应当
-    **换号重试**，而不是像传输层故障那样在原账号上重试、也不是直接 502。
+    两类都与账号绑定，同一请求换号通常就能成功：
+      · 配额耗尽（上游 4008 / exceeded the quota）；
+      · HTTP200 + 空 SSE 流（solo returned empty content）—— 上游没生成任何
+        token，通常也没计费；挂了 solo_empty 标记表示无 reasoning 帧。
+    注意 reasoning 非空但 content 为空的情况不算（上游已生成过内容，重放会
+    重复计费），那种异常 solo_empty=False，这里会返回 False。
     """
+    if getattr(exc, "solo_empty", False):
+        return True
     text = str(exc or "").lower()
     return ("4008" in text) or ("exceeded the quota" in text)
 

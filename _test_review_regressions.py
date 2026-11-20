@@ -243,12 +243,28 @@ def test_model_suggestion():
         4008, "trae 4008 quota exceeded", model="D4f")
     check("4008 不受影响", kind4 == "quota_exceeded", "实际=%r" % kind4)
 
+def test_solo_empty_content_switch():
+    """SOLO 空内容：未计费可换号，有 reasoning 已计费不可重放。"""
+    import trae_proxy
+    e_quota = RuntimeError("solo error 4008: exceeded the quota")
+    e_empty = RuntimeError("solo returned empty content"); e_empty.solo_empty = True
+    e_billed = RuntimeError("solo returned empty content"); e_billed.solo_empty = False
+    cases = [
+        ("配额4008", e_quota, True),
+        ("空内容未计费", e_empty, True),
+        ("空内容已计费", e_billed, False),
+        ("普通业务错", RuntimeError("solo error 5001"), False),
+    ]
+    for name, exc, expect in cases:
+        got = trae_proxy._solo_quota_exhausted(exc)
+        check("换号判定 %s" % name, got is expect, "实际=%r" % got)
+
 
 if __name__ == "__main__":
     for fn in (test_safe_uid, test_as_float, test_mutex,
                test_checkin_record_not_overwritten, test_energy_consistency,
                test_disabled_opt_in, test_solo_quota_detection,
-               test_model_suggestion):
+               test_model_suggestion, test_solo_empty_content_switch):
         fn()
     print("\n汇总: PASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

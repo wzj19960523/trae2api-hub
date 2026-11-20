@@ -696,3 +696,42 @@ while account is not None:
 
 **验证**：实测 `D4f` → 「你可能想填：DeepSeek-V4-Flash」；非法模型请求秒回 400（不消耗积分）；
 合法 `DeepSeek-V4-Flash` 请求仍正常返回 choices；`_test_trae.py` 240 + 回归测试 53 全通过。
+
+### 1.10 Patch 14：SOLO 空内容静默拒答（`solo returned empty content`）
+
+**现象**：WorkBuddy 报 `The custom model provider has returned empty content. (502)`，
+与 4008 交替出现。截图显示两条错误（一条 4008、一条空内容）。
+
+**时序核对（先排除误读）**
+
+- 4008 日志集中在 09:25~10:00，最后一条 10:00:33；截图时间 10:04 附近只有
+  成功请求（10:04:56 200），且 10:05:23 仍有换号日志 → 换号修复一直在工作。
+  截图里的 4008 是客户端对先前失败请求的残留展示，非当时新发生。
+- 空内容是**真新增**问题：日志里没有 `request error ... empty content`
+  （因为它发生在 SOLO 内部、未走 record_error），需从代码路径定位。
+
+**根因**
+
+`trae_solo_chat` 在读完 SSE 流后，若 `text_parts/reasoning/tool_calls` 全空，抛
+`RuntimeError("solo returned empty content")`。该异常既非配额（`_solo_quota_exhausted
+=False`）也非传输抖动（`_is_transient_transport=False`），在 SOLO 换号循环里直接
+`break` → 502。但它本质是「该账号此刻不可用」的静默版本（上游 200 但没给内容），
+换号就能解决 —— 与 4008 同类，却漏在换号判定之外。
+
+**修复（带计费安全分寸）**
+
+```python
+if not content and not tool_calls:
+    exc = RuntimeError("solo returned empty content")
+    exc.solo_empty = not bool(reasoning_parts)   # 无 reasoning = 未计费 = 可换号
+    raise exc
+# _solo_quota_exhausted 纳入 solo_empty
+```
+
+- 完全没内容（含 reasoning 也空）→ 上游没生成 token，通常没计费 → 换号重放安全。
+- 有 reasoning 但无 content → 上游已生成过内容、很可能已计费 → `solo_empty=False`
+  → 不换号，避免重复扣费。
+
+**验证**：连发 12 次 `/v1/agent/chat` → 12/12 成功，日志见
+`solo 配额不足（29614286），换账号 30318339 继续`；单元级 5 种异常分类全对；
+`240 + 57` 测试通过。
