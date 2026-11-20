@@ -7669,9 +7669,43 @@ def _is_transient_transport(exc):
     return False
 
 
-def friendly_upstream_error(code, detail):
+def _model_suggestion(model, limit=3):
+    """4023 时给出「你可能想填 X」的候选（从本地模型目录的名字/别名里找）。
+
+    只在**错误路径**调用，不参与选号，因此不影响/误杀任何请求。目录是本地
+    快照，可能滞后于上游 —— 所以只做提示，绝不替客户端改写 model。
+    """
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return ""
+    try:
+        import difflib
+        names = set()
+        for realm in ("cn", "intl"):
+            for entry in trae_catalog.all_models(realm):
+                # 建议只展示「display_name / 目录 id」这类人类可读写法；
+                # 紧凑别名（deepseekv4flash）匹配得到但不展示，避免误导。
+                for cand in ([entry.get("display_name"), entry.get("id"),
+                              entry.get("key")]):
+                    if cand:
+                        names.add(str(cand))
+        low_map = {}
+        for name in names:
+            low_map.setdefault(name.lower(), name)
+        keys = list(low_map)
+        # 短输入（如 d4f = DeepSeek-V4-Flash 的缩写）相似度天然低，单独放宽；
+        # 长输入保持严格，避免给乱码拼出一个误导性的「你可能想填」。
+        cutoff = 0.3 if len(raw) <= 5 else 0.55
+        hits = difflib.get_close_matches(raw, keys, n=limit, cutoff=cutoff)
+        return ", ".join(low_map[h] for h in hits)
+    except Exception:
+        return ""
+
+
+def friendly_upstream_error(code, detail, model=None):
     """把上游错误转成对客户端可读的消息；瞬时故障给出重试指引。
 
+    model：可选，仅用于 4023 给出「你可能想填 X」的建议（见 _model_suggestion）。
     返回 (message, err_type)。
     """
     detail = (detail or "").strip()
@@ -7696,10 +7730,13 @@ def friendly_upstream_error(code, detail):
                 "原地重试不会解决。上游详情：%s" % (detail[:240] or "(无详情)"),
                 "risk_control")
     if "trae 4023" in detail or "model_unknown" in detail:
-        return ("上游不认识该模型（Trae 4023）。若 /v1/models 里该条 "
-                "available=false / catalog_only=true，表示目录里有、但当前账号的 "
-                "model_list 未返回它（套餐/账号未开通）；否则请检查 id 是否拼错。"
-                "上游详情：%s" % (detail[:200] or "(无详情)"), "model_unknown")
+        suggestion = _model_suggestion(model)
+        hint = (" 你可能想填：%s（请从 /v1/models 的 id 里原样复制）。" % suggestion
+                if suggestion else
+                " 请从 /v1/models 返回的 id 里原样复制一个再试。")
+        return ("上游不认识该模型（Trae 4023）：%s。" % (model or "(空)")
+                + hint
+                + "上游详情：%s" % (detail[:200] or "(无详情)"), "model_unknown")
     if "trae 4001" in detail or "invalid_request" in detail:
         return ("请求参数非法（Trae 4001）：检查 messages 的 parts 结构与模型名。"
                 "上游详情：%s" % (detail[:200] or "(无详情)"),
@@ -11748,7 +11785,7 @@ class Handler(BaseHTTPRequestHandler):
                     detail = ""
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000))
-            msg, etype = friendly_upstream_error(exc.code, detail)
+            msg, etype = friendly_upstream_error(exc.code, detail, model)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
@@ -11798,7 +11835,7 @@ class Handler(BaseHTTPRequestHandler):
                     wall = int((time.time() - t_start) * 1000)
                     record_error(model, exc.status, exc.detail, elapsed_ms=wall)
                     msg, _ = friendly_upstream_error(_to_int_status(exc.status),
-                                                     exc.detail)
+                                                     exc.detail, model)
                     log("anthropic upstream status %s: %s"
                         % (exc.status, msg[:200]), level="ERROR", tag="chat")
                     self._sse_write(trae_anthropic.anthropic_error_frame(msg))
@@ -11824,7 +11861,7 @@ class Handler(BaseHTTPRequestHandler):
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
-                                                     exc.detail)
+                                                     exc.detail, model)
                 return self._error(
                     exc.status if str(exc.status).isdigit() else 502, msg, etype)
             except Exception as exc:
@@ -11902,7 +11939,7 @@ class Handler(BaseHTTPRequestHandler):
                     detail = ""
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000))
-            msg, etype = friendly_upstream_error(exc.code, detail)
+            msg, etype = friendly_upstream_error(exc.code, detail, model)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
@@ -12001,7 +12038,7 @@ class Handler(BaseHTTPRequestHandler):
                     record_error(model, pump_exc.status, pump_exc.detail,
                                  elapsed_ms=int((time.time() - t_start) * 1000))
                     msg, _ = friendly_upstream_error(
-                        _to_int_status(pump_exc.status), pump_exc.detail)
+                        _to_int_status(pump_exc.status), pump_exc.detail, model)
                     log("responses upstream status %s: %s"
                         % (pump_exc.status, msg[:200]), level="ERROR",
                         tag="chat")
@@ -12033,7 +12070,7 @@ class Handler(BaseHTTPRequestHandler):
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
-                                                     exc.detail)
+                                                     exc.detail, model)
                 return self._error(exc.status if str(exc.status).isdigit() else 502,
                                    msg, etype)
             except Exception as exc:
@@ -12335,7 +12372,7 @@ class Handler(BaseHTTPRequestHandler):
                     detail = ""
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000))
-            msg, etype = friendly_upstream_error(exc.code, detail)
+            msg, etype = friendly_upstream_error(exc.code, detail, model)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
@@ -12426,7 +12463,7 @@ class Handler(BaseHTTPRequestHandler):
                     wall = int((time.time() - t_start) * 1000)
                     record_error(model, exc.status, exc.detail, elapsed_ms=wall)
                     msg, etype = friendly_upstream_error(
-                        _to_int_status(exc.status), exc.detail)
+                        _to_int_status(exc.status), exc.detail, model)
                     err = json.dumps({"error": {
                         "message": msg, "type": etype,
                         "code": exc.status}}, ensure_ascii=False)
@@ -12470,7 +12507,7 @@ class Handler(BaseHTTPRequestHandler):
                 if code < 400 or code > 599:
                     code = 502
                 msg, etype = friendly_upstream_error(
-                    _to_int_status(exc.status), exc.detail)
+                    _to_int_status(exc.status), exc.detail, model)
                 return self._error(code, msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),

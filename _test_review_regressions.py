@@ -221,10 +221,34 @@ def test_solo_quota_detection():
               "实际=%r" % got)
 
 
+def test_model_suggestion():
+    """4023 错误提示：缩写能给出正确建议，乱码不误报，向后兼容。"""
+    import trae_proxy
+    detail = "trae 4023 model_unknown: We're sorry, the model is unknown."
+    # 缩写 -> 建议真实目录 id
+    msg, kind = trae_proxy.friendly_upstream_error(4023, detail, model="D4f")
+    check("4023 kind", kind == "model_unknown", "实际=%r" % kind)
+    check("D4f 建议 DeepSeek-V4-Flash", "DeepSeek-V4-Flash" in msg,
+          "文案=%r" % msg[:120])
+    # 乱码 -> 不给误导性建议
+    msg2, _ = trae_proxy.friendly_upstream_error(4023, detail,
+                                                 model="gpt-xyz-nonexist")
+    check("乱码不误报建议", "你可能想填" not in msg2, "文案=%r" % msg2[:120])
+    # 不传 model -> 向后兼容（不抛异常）
+    msg3, kind3 = trae_proxy.friendly_upstream_error(4023, detail)
+    check("不传 model 兼容", kind3 == "model_unknown" and "请从 /v1/models" in msg3,
+          "文案=%r" % msg3[:120])
+    # 其他错误码不受 model 参数影响
+    msg4, kind4 = trae_proxy.friendly_upstream_error(
+        4008, "trae 4008 quota exceeded", model="D4f")
+    check("4008 不受影响", kind4 == "quota_exceeded", "实际=%r" % kind4)
+
+
 if __name__ == "__main__":
     for fn in (test_safe_uid, test_as_float, test_mutex,
                test_checkin_record_not_overwritten, test_energy_consistency,
-               test_disabled_opt_in, test_solo_quota_detection):
+               test_disabled_opt_in, test_solo_quota_detection,
+               test_model_suggestion):
         fn()
     print("\n汇总: PASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

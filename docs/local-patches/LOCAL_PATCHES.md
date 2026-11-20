@@ -668,3 +668,31 @@ while account is not None:
 
 **注意**：换号仅发生在**未向客户端写出任何字节**时（4008 在首帧前返回），重放安全；
 若错误发生在流中途（`solo_received=True`）则不会重试，避免重复计费。
+
+### 1.9 Patch 13：Trae 4023 model_unknown（自定义模型 id 填错）
+
+**现象**：客户端自定义模型报 `上游不认识该模型（Trae 4023）`，
+上游详情 `trae 4023 model_unknown: We're sorry, the model is unknown`。
+
+**定位（三步排除法）**
+
+1. **错误文案是网关自己生成的**（`friendly_upstream_error` 的 4023 分支），
+   说明上游已明确回 4023（模型名不认识），不是传输/配额问题。
+2. **查模型目录**：`/v1/models` 共 27 个模型，**没有 `D4f`**；最接近的是
+   `DeepSeek-V4-Flash`、`deepseek-v4-flash-0731`。`resolve_upstream_key("D4f")`
+   原样返回（不在别名表）→ 直接发给上游 → 4023。
+3. **查日志模式**：`D4f` 请求有的先 429（`try 2/3`/`try 3/3`，在途重试），
+   最终 4023；`code in TRAE_CLIENT_FAULT_CODES=(4001,4023)` 已保证 4023 立即失败不换号，
+   所以不是「换号到不支持的号」——就是 id 本身拼错。
+
+**修复：只优化错误提示，不改选号/预检**
+
+| 约束 | 做法 |
+|---|---|
+| 不能误杀「上游有但本地目录滞后」的合法模型 | 不在 `_model_precheck` 硬拦，只在**错误路径**给建议 |
+| 缩写 `d4f` 与 `deepseek-v4-flash` 相似度低 | `_model_suggestion` 对短输入（≤5）用 cutoff=0.3，长输入 0.55 |
+| 乱码不能被误导 | `gpt-xyz-nonexist` 实测无建议 |
+| 向后兼容 | `friendly_upstream_error` 新增可选 `model=None`，9 处调用点全传入 |
+
+**验证**：实测 `D4f` → 「你可能想填：DeepSeek-V4-Flash」；非法模型请求秒回 400（不消耗积分）；
+合法 `DeepSeek-V4-Flash` 请求仍正常返回 choices；`_test_trae.py` 240 + 回归测试 53 全通过。

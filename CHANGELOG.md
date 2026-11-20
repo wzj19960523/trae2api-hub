@@ -1,3 +1,23 @@
+## [1.7.0-local.9] - 2026-11-20
+
+> 本地补丁版本（非上游）。优化 **`Trae 4023 model_unknown`** 的错误提示：直接给出最相似的合法模型 id。
+
+### 根因
+
+客户端自定义模型填了 `D4f` —— `/v1/models` 的 27 个模型里根本没有这个 id，
+上游自然回 4023。`D4f` 是 `DeepSeek-V4-Flash` 的误写/缩写。
+原提示只说「请检查 id 是否拼错」，用户无从下手。
+
+### 修复
+
+- 新增 `_model_suggestion()`：从本地模型目录的 display_name/id/key 里用 difflib 找最相似项。
+  - 短输入（≤5 字符，典型缩写如 `d4f`）放宽 cutoff 到 0.3；长输入保持 0.55 避免乱码误报。
+  - 只在错误路径调用，不参与选号 → 不误杀「上游有但本地目录滞后」的合法模型。
+- `friendly_upstream_error(code, detail, model=None)`：新增可选 `model`，4023 分支给出
+  「你可能想填：X（请从 /v1/models 的 id 里原样复制）」。9 处调用点全部传入 model。
+- 实测：`D4f` → 建议 `DeepSeek-V4-Flash`；乱码 `gpt-xyz-nonexist` → 不给误导建议；
+  不传 model 向后兼容；4008/4015/4001 等其他错误码不受影响。
+
 ## [1.7.0-local.8] - 2026-11-20
 
 > 本地补丁版本（非上游）。修复 **`solo error 4008: Your requests have exceeded the quota`**。
