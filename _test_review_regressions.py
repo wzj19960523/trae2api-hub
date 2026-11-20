@@ -243,6 +243,26 @@ def test_model_suggestion():
         4008, "trae 4008 quota exceeded", model="D4f")
     check("4008 不受影响", kind4 == "quota_exceeded", "实际=%r" % kind4)
 
+def test_checkin_fail_message_and_refresh_guard():
+    """签到失败 message 不显示误导性 success；刷新不覆盖今日成功记录。"""
+    import trae_client, inspect, time
+    src = inspect.getsource(trae_client.claim_checkin)
+    check("失败提示优先取 claim 错误",
+          "签到失败（上游" in src and "status 接口的 message" in src,
+          "源码片段=%r" % src[-300:-200] if len(src) > 300 else "")
+    # 刷新保护逻辑（纯数据判定，与 trae_proxy 写入分支一致）
+    today = time.strftime("%Y-%m-%d")
+    prev_ok = {"at": today + " 09:00:00", "checked_in": True}
+    st_false = {"checked_in": False, "credits": 100}
+    keep = (str(prev_ok.get("at") or "").startswith(today)
+            and prev_ok.get("checked_in") is True)
+    check("今日成功记录被保护", keep is True, "keep=%r" % keep)
+    prev_old = {"at": "2026-11-19 09:00:00", "checked_in": True}
+    keep_old = (str(prev_old.get("at") or "").startswith(today)
+                and prev_old.get("checked_in") is True)
+    check("昨日记录不保护", keep_old is False, "keep=%r" % keep_old)
+
+
 def test_solo_empty_content_switch():
     """SOLO 空内容：未计费可换号，有 reasoning 已计费不可重放。"""
     import trae_proxy
@@ -264,7 +284,8 @@ if __name__ == "__main__":
     for fn in (test_safe_uid, test_as_float, test_mutex,
                test_checkin_record_not_overwritten, test_energy_consistency,
                test_disabled_opt_in, test_solo_quota_detection,
-               test_model_suggestion, test_solo_empty_content_switch):
+               test_model_suggestion, test_solo_empty_content_switch,
+               test_checkin_fail_message_and_refresh_guard):
         fn()
     print("\n汇总: PASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

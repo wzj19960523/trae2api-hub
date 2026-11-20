@@ -1617,11 +1617,25 @@ def account_fetch_credits(account):
                         if not isinstance(extra, dict):
                             extra = {}
                             account.extra = extra
+                        # 刷新账单入口：只更新积分数字，不覆盖签到状态。
+                        # 原因：checkin_status 有延迟（签到刚成功它仍返回 false），
+                        # 无条件写 bool(st["checked_in"]) 会把签到任务刚落盘的
+                        # 成功记录打回 false → 看板「今日未签到」（2026-11-20 实测）。
+                        # 签到状态由签到任务路径（/tasks/run、定时任务）权威维护。
+                        prev = extra.get("checkin")
+                        prev = prev if isinstance(prev, dict) else {}
+                        prev_at = str(prev.get("at") or "")
+                        today = time.strftime("%Y-%m-%d")
+                        keep_today_ok = (prev_at.startswith(today)
+                                         and prev.get("checked_in") is True)
+                        new_checked = (True if keep_today_ok
+                                       else bool(st.get("checked_in")))
                         extra["checkin"] = {
-                            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                            "checked_in": bool(st.get("checked_in")),
+                            # 保留今天成功记录的原始时间；否则用当前刷新时间
+                            "at": prev_at if keep_today_ok else time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "checked_in": new_checked,
                             "credits": int(st.get("credits") or 0),
-                            "earned_credit": 0,
+                            "earned_credit": prev.get("earned_credit") or 0,
                         }
                 except Exception as exc:
                     errors.append("checkin_status: %s" % str(exc)[:160])

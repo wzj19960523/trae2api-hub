@@ -1402,8 +1402,16 @@ def claim_checkin(account, realm=None, timeout=30):
         message = ("上游已受理签到但状态尚未刷新（已重试 %d 次），"
                    "请稍后刷新查看；本账号积分 %s" % (retries, after_credits))
     else:
-        message = (after.get("message") or (raw or {}).get("message")
-                   or "签到未生效")
+        # 失败时 message 必须优先取 claim 的真实错误：status 接口的 message
+        # 恒为 "success"（与签到结果无关），若优先取它会得到自相矛盾的
+        # 「签到未生效：success」（2026-11-20 实测 code=9074  participant busy）。
+        claim_msg = str((raw or {}).get("message") or "")
+        claim_code = (raw or {}).get("code")
+        if claim_msg:
+            message = "签到失败（上游 %s）：%s" % (
+                claim_code if claim_code not in (None, "") else "?", claim_msg)
+        else:
+            message = after.get("message") or "签到未生效"
     return {"ok": ok, "checked_in": bool(after.get("checked_in")),
             "already": False, "credits": after_credits,
             "earned_credit": earned,

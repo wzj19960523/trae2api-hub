@@ -735,3 +735,25 @@ if not content and not tool_calls:
 **验证**：连发 12 次 `/v1/agent/chat` → 12/12 成功，日志见
 `solo 配额不足（29614286），换账号 30318339 继续`；单元级 5 种异常分类全对；
 `240 + 57` 测试通过。
+
+### 1.11 Patch 15：签到失败提示误导 + 刷新覆盖签到状态
+
+**现象**：看板两个账号显示「今日未签到」，签到日志却写「签到未生效：success」，
+用户问「是展示问题吗」。
+
+**实测定位**：逐账号手动 `claim_checkin` → 上游返回
+`{"code":9074,"message":"当前参与用户太多，请稍后再试"}`，
+`checkin_status` 返回 `checked_in=false, did_checked_in=false, message="success"`。
+结论：**上游签到服务繁忙，真的没签上，不是展示问题**。
+
+**两处代码 bug（放大了误导）**
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | `claim_checkin` 失败 message 用 `after.message or raw.message`，status 的 message 恒为 "success" → 显示「签到未生效：success」 | 失败时优先取 claim 的 `code + message`：`签到失败（上游 9074）：当前参与用户太多，请稍后再试` |
+| 2 | 刷新账单入口无条件用 `checkin_status.checked_in=false` 覆盖账号文件，状态延迟时会打回刚落盘的成功记录 | 本地已有今天成功记录时保留 `checked_in/at`，只更新积分数字 |
+
+**验证**：重启后手动签 → 显示真实 9074 原因；`240 + 60` 测试通过。
+
+**运维提示**：9074 是上游侧繁忙，代码无法代签成功；等上游恢复后重新签到即可，
+或避开高峰。今后日志会如实显示上游错误码，不再误报 success。
