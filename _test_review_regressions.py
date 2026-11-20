@@ -203,10 +203,28 @@ def test_disabled_opt_in():
           "实际=%r" % calls)
 
 
+def test_solo_quota_detection():
+    print("[R7] SOLO 配额错误识别（换号重试的判定依据）")
+    import trae_proxy
+    cases = [
+        ("solo error 4008: Your requests have exceeded the quota.", True),
+        ("solo error 4008: x", True),
+        ("solo HTTP 500: boom", False),
+        ("solo error 5001: rate limited", False),
+        ("connection reset by peer", False),
+        ("", False),
+        (None, False),
+    ]
+    for msg, expect in cases:
+        got = trae_proxy._solo_quota_exhausted(RuntimeError(msg) if msg else None)
+        check("_solo_quota_exhausted(%r)=%r" % (msg, expect), got is expect,
+              "实际=%r" % got)
+
+
 if __name__ == "__main__":
     for fn in (test_safe_uid, test_as_float, test_mutex,
                test_checkin_record_not_overwritten, test_energy_consistency,
-               test_disabled_opt_in):
+               test_disabled_opt_in, test_solo_quota_detection):
         fn()
     print("\n汇总: PASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

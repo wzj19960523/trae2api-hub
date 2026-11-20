@@ -7640,6 +7640,16 @@ def _is_transient_upstream(code, detail):
     return False
 
 
+def _solo_quota_exhausted(exc):
+    """是否是「该账号 SOLO 通道配额耗尽」的业务错误（上游 4008）。
+
+    这类错误与账号绑定：同一请求换一个账号通常就能成功。因此调用方应当
+    **换号重试**，而不是像传输层故障那样在原账号上重试、也不是直接 502。
+    """
+    text = str(exc or "").lower()
+    return ("4008" in text) or ("exceeded the quota" in text)
+
+
 def _is_transient_transport(exc):
     """传输层瞬时故障（对上游域的 TLS/连接抖动很常见）：可同账号重试。
 
@@ -11060,32 +11070,57 @@ class Handler(BaseHTTPRequestHandler):
         # 仅重试瞬时故障（_is_transient_transport 覆盖 SSL EOF、reset、timeout），
         # 业务错误立即抛出。此刻尚未向客户端写出任何字节，重放安全。
         result = None
-        for attempt in range(TRANSIENT_MAX_RETRIES + 1):
-            try:
-                result = trae_solo_chat(account, {**payload, "model": model})
+        last_exc = None
+        # 两层循环：
+        #  内层 —— 同账号的传输层重试（TLS EOF / reset / timeout）；
+        #  外层 —— **换号**：SOLO 通道的配额是**按账号**算的，某个账号
+        #          `4008 exceeded the quota` 时其余账号往往完全正常。此前
+        #          选到该账号就直接 502，4 个号里有 1 个超额 → 约 25% 请求
+        #          必然失败（与 09:25 日志里"成功/失败交替"完全吻合）。
+        tried = set()
+        switch_account = False
+        while account is not None:
+            tried.add(account.uid)
+            switch_account = False
+            for attempt in range(TRANSIENT_MAX_RETRIES + 1):
+                try:
+                    result = trae_solo_chat(account, {**payload, "model": model})
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    # 配额类业务错误：换号，不占用传输层重试次数
+                    if _solo_quota_exhausted(exc):
+                        switch_account = True
+                        break
+                    # 不重放的三种情况：
+                    # ① 已达重试上限；
+                    # ② `solo_received` = 流里已收到过内容 → 上游已生成/计费，重放会重复扣额度；
+                    # ③ 带明确 HTTP 状态码（应用层错误，重放必然同样失败）。
+                    if (attempt >= TRANSIENT_MAX_RETRIES
+                            or getattr(exc, "solo_received", False)
+                            or (time.monotonic() - started) > SOLO_RETRY_MAX_ELAPSED
+                            or isinstance(exc, urllib.error.HTTPError)
+                            or not _is_transient_transport(exc)):
+                        break
+                    log("solo 传输层抖动，%.0fs 后重试 %d/%d：%s"
+                        % (float(attempt + 1), attempt + 1, TRANSIENT_MAX_RETRIES,
+                           str(exc)[:120]), level="WARN", tag="chat")
+                    time.sleep(float(attempt + 1))
+            if result is not None:
                 break
-            except Exception as exc:
-                # 不重放的三种情况：
-                # ① 已达重试上限；
-                # ② `solo_received` = 流里已收到过内容 → 上游已生成/计费，重放会重复扣额度；
-                # ③ 带明确 HTTP 状态码（应用层错误，重放必然同样失败）。
-                if (attempt >= TRANSIENT_MAX_RETRIES
-                        or getattr(exc, "solo_received", False)
-                        or (time.monotonic() - started) > SOLO_RETRY_MAX_ELAPSED
-                        or isinstance(exc, urllib.error.HTTPError)
-                        or not _is_transient_transport(exc)):
-                    record_error(model, 502, str(exc)[:200],
-                                 elapsed_ms=int((time.monotonic()-started)*1000))
-                    return self._error(502, "Trae SOLO upstream failed: %s" % exc,
-                                       "upstream_error")
-                log("solo 传输层抖动，%.0fs 后重试 %d/%d：%s"
-                    % (float(attempt + 1), attempt + 1, TRANSIENT_MAX_RETRIES,
-                       str(exc)[:120]), level="WARN", tag="chat")
-                time.sleep(float(attempt + 1))
+            if not switch_account:
+                break
+            nxt = POOL.pick(realm="cn", exclude=tried) if POOL else None
+            if nxt is None:
+                break
+            log("solo 配额不足（%s），换账号 %s 继续"
+                % (account.uid[:8], nxt.uid[:8]), level="WARN", tag="chat")
+            account = nxt
         if result is None:
-            record_error(model, 502, "solo retry exhausted",
+            record_error(model, 502, str(last_exc or "solo retry exhausted")[:200],
                          elapsed_ms=int((time.monotonic()-started)*1000))
-            return self._error(502, "Trae SOLO upstream failed: retry exhausted",
+            return self._error(502, "Trae SOLO upstream failed: %s"
+                               % (last_exc or "retry exhausted"),
                                "upstream_error")
         record_usage(model, result.get("usage"), stream=bool(payload.get("stream")),
                      elapsed_ms=int((time.monotonic()-started)*1000),

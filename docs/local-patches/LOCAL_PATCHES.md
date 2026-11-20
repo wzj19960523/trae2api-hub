@@ -623,3 +623,48 @@ def _resolve_credits(account, snapshot=None):
 
 **流程**：本轮同样出现基线漂移（主控在子进程运行期间修代码）。已确认这几处改动均由子进程报告触发，
 最终以**工作区实际代码**为准重新跑全部测试，不依赖子进程对行号的引用。
+
+### 1.8 Patch 12：SOLO `4008 exceeded the quota`（按账号的 SOLO 配额）
+
+**现象**：WorkBuddy 走 `/v1/agent/chat` 时常报 `Trae SOLO upstream failed: solo error 4008:
+Your requests have exceeded the quota`，但同一模型走普通对话正常、直连 Trae 也正常。
+
+**定位过程（三步排除法）**
+
+1. **看错误来源**：错误串带 `solo ` 前缀，来自 `trae_solo_chat` 的**流事件**（`event.code=4008`），
+   不是 HTTP 错误 ⇒ 请求已被上游接受，属业务拒绝。
+2. **看日志模式**：`gateway.log` 里成功与失败**交替**出现；成功请求都带 `acct=xxxx`，
+   失败请求 282~358ms 秒拒且**没有 `acct=`** ⇒ 失败走的是另一条通道（SOLO），不是"账号额度整体耗尽"。
+3. **逐账号直测**：4 个账号里只有 `29614286`（用户0360271905）报 4008，其余 3 个正常
+   ⇒ 配额是**按账号**算的，`POOL.pick()` 随机选到它就必然失败（约 25%）。
+
+**排除的误判**
+
+| 假设 | 验证 | 结论 |
+|---|---|---|
+| `max_tokens` 默认 1000000 导致预扣超额 | A/B 实测 1000000 与 8192 均成功 | 排除 |
+| 账号总额度耗尽 | 同账号普通通道 `/v1/chat/completions` 正常 | 排除 |
+| 并发/频率超限 | 单发也复现（逐账号测试第 3 个即失败） | 排除 |
+
+**修复**
+
+```python
+# _handle_agent_solo：外层换号 + 内层传输重试
+tried = set()
+while account is not None:
+    tried.add(account.uid)
+    try:
+        result = trae_solo_chat(account, {**payload, "model": model})
+        break
+    except Exception as exc:
+        if _solo_quota_exhausted(exc):        # 4008 / exceeded the quota
+            account = POOL.pick(realm="cn", exclude=tried)
+            continue                          # 换号，不占用传输重试次数
+        ...
+```
+
+**验证**：连发 8 次 `/v1/agent/chat` → **8/8 成功**（修复前按概率应失败约 2 次）；
+日志可见 `solo 配额不足（29614286），换账号 30318339 继续`。
+
+**注意**：换号仅发生在**未向客户端写出任何字节**时（4008 在首帧前返回），重放安全；
+若错误发生在流中途（`solo_received=True`）则不会重试，避免重复计费。
