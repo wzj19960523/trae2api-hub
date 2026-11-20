@@ -1622,7 +1622,29 @@ def account_fetch_credits(account):
                         # 无条件写 bool(st["checked_in"]) 会把签到任务刚落盘的
                         # 成功记录打回 false → 看板「今日未签到」（2026-11-20 实测）。
                         # 签到状态由签到任务路径（/tasks/run、定时任务）权威维护。
+                        # 关键：从磁盘重读最新的 checkin 记录作为 prev，而不是用
+                        # 内存里的 account.extra —— 后者可能是加载时的陈旧快照。
+                        # 并发场景（用户边签到边刷新）：签到任务可能刚把成功记录
+                        # 原子落盘（os.replace），而本线程持有的 account 实例还是
+                        # 签到前的旧 extra；若用旧实例判定会得到 keep_today_ok=False
+                        # 并在 save() 时把成功记录覆盖回 false。磁盘读取不受影响，
+                        # 因为 save 是原子的（要么旧要么新，不会读到半写）。
                         prev = extra.get("checkin")
+                        disk_path = getattr(account, "path", None)
+                        disk_prev = None
+                        if disk_path and os.path.isfile(disk_path):
+                            try:
+                                with open(disk_path, encoding="utf-8") as fh:
+                                    disk_data = json.load(fh)
+                                if isinstance(disk_data, dict):
+                                    cand = (disk_data.get("extra") or {}).get("checkin")
+                                    if isinstance(cand, dict):
+                                        disk_prev = cand
+                            except Exception:
+                                disk_prev = None
+                        # 磁盘记录比内存更新（或内存没有）时以磁盘为准。
+                        if isinstance(disk_prev, dict):
+                            prev = disk_prev
                         prev = prev if isinstance(prev, dict) else {}
                         prev_at = str(prev.get("at") or "")
                         today = time.strftime("%Y-%m-%d")
@@ -7673,6 +7695,12 @@ def _solo_quota_exhausted(exc):
     注意 reasoning 非空但 content 为空的情况不算（上游已生成过内容，重放会
     重复计费），那种异常 solo_empty=False，这里会返回 False。
     """
+    # 最高优先级：流里已收到过内容（solo_received=True）说明上游已生成、
+    # 很可能已计费。此时即使异常文本是 4008/空内容，也**绝不能换号重放**——
+    # 换号会把同一请求再发一次，重复扣额度（第三轮复核 P0）。
+    # 首帧前的 4008 不带该标记，仍正常换号。
+    if getattr(exc, "solo_received", False):
+        return False
     if getattr(exc, "solo_empty", False):
         return True
     text = str(exc or "").lower()
@@ -7706,6 +7734,10 @@ def _model_suggestion(model, limit=3):
     """
     raw = str(model or "").strip().lower()
     if not raw:
+        return ""
+    # 明显不是模型名的占位输入不给建议：difflib 在短串+低 cutoff 下会把
+    # "none" 猜成 "refactor_planner" 这类完全无关的项（第三轮复核 P2）。
+    if raw in ("none", "null", "undefined", "auto", "default", "test", "xxx"):
         return ""
     try:
         import difflib
@@ -7761,10 +7793,13 @@ def friendly_upstream_error(code, detail, model=None):
     if "trae 4023" in detail or "model_unknown" in detail:
         suggestion = _model_suggestion(model)
         hint = (" 你可能想填：%s（请从 /v1/models 的 id 里原样复制）。" % suggestion
-                if suggestion else
-                " 请从 /v1/models 返回的 id 里原样复制一个再试。")
+                if suggestion else " 请从 /v1/models 返回的 id 里原样复制一个再试。")
+        # 补回被旧文案覆盖的诊断维度：目录里有但 available=false 的模型，
+        # 换 id 无用，得靠对应套餐/账号（第三轮复核：新版曾丢失此引导）。
         return ("上游不认识该模型（Trae 4023）：%s。" % (model or "(空)")
                 + hint
+                + " 若该 id 在 /v1/models 里显示 available=false，则是目录里有、"
+                "但当前账号套餐未开通，换 id 无用、需换有权限的账号。"
                 + "上游详情：%s" % (detail[:200] or "(无详情)"), "model_unknown")
     if "trae 4001" in detail or "invalid_request" in detail:
         return ("请求参数非法（Trae 4001）：检查 messages 的 parts 结构与模型名。"
@@ -11175,6 +11210,13 @@ class Handler(BaseHTTPRequestHandler):
             if result is not None:
                 break
             if not switch_account:
+                break
+            # 墙钟上限同样约束外层换号：内层只管同号重试，若多个号各自慢，
+            # 换号循环可累计远超上限（4 号×30s=120s > 60s）。客户端早放弃，
+            # 这里继续换号只是白耗资源（第三轮复核 P2）。
+            if (time.monotonic() - started) > SOLO_RETRY_MAX_ELAPSED:
+                log("solo 换号累计耗时超过 %.0fs，停止换号"
+                    % SOLO_RETRY_MAX_ELAPSED, level="WARN", tag="chat")
                 break
             nxt = POOL.pick(realm="cn", exclude=tried) if POOL else None
             if nxt is None:

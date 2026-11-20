@@ -1,3 +1,35 @@
+## [1.7.0-local.12] - 2026-11-20
+
+> 本地补丁版本（非上游）。第三轮对抗复核（专审前四次修复是否完全）——抓到 1 个 P0 重复计费 + 3 个 P1。
+
+### P0：流中途 4008 换号 → 重复计费
+
+`_solo_quota_exhausted` 只看异常文本（`4008`），在 `solo_received` 检查**之前**触发换号。
+若流里已收到内容（上游已计费）时才收到 4008，换号会把同一请求重发 → 重复扣额度。
+修：`_solo_quota_exhausted` 开头加 `if solo_received: return False`。
+
+### P1
+
+1. `claim_checkin` 失败 message 在 `raw=None`/空/无 message 时仍退回 `after.message="success"`
+   ——"签到未生效：success"在这些分支仍出现。改用状态码兜底文案。
+2. 刷新与签到并发的读-改-写竞态：刷新持有陈旧的 `account.extra`，签到刚落盘成功，
+   刷新 `save()` 又把成功覆盖成 false。修：写 checkin 前**从磁盘重读**最新记录作 prev
+   （save 是 os.replace 原子写，读取安全），不以共锁避免 pacing sleep 卡住刷新。
+3. 回归测试 `test_checkin_fail_message_and_refresh_guard` 是"纯数据判定"，复制判定式自算，
+   从不调用被测函数——删掉生产保护测试仍 PASS。重写为真调用 `account_fetch_credits`
+   + `claim_checkin`（打桩 client/request_json），含并发磁盘重读场景。
+
+### P2
+
+- 4023 新文案补回 `catalog_only/套餐未开通` 诊断维度（换 id 无用的场景）；
+  "None"/"null" 等占位输入不再给出 `refactor_planner` 这类误导建议。
+- 墙钟上限 `SOLO_RETRY_MAX_ELAPSED` 扩展到外层换号循环（此前只管内层重试，
+  4 号×30s=120s 超过 60s 上限仍继续换号）。
+
+### 验证
+
+`240 + 65` 测试通过；负向自测证明 3 项修复改坏后测试会 FAIL；端到端 SOLO 10/10 成功。
+
 ## [1.7.0-local.11] - 2026-11-20
 
 > 本地补丁版本（非上游）。修复签到失败提示误导（`签到未生效：success`）与刷新覆盖签到状态。

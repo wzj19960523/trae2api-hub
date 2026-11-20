@@ -757,3 +757,32 @@ if not content and not tool_calls:
 
 **运维提示**：9074 是上游侧繁忙，代码无法代签成功；等上游恢复后重新签到即可，
 或避开高峰。今后日志会如实显示上游错误码，不再误报 success。
+
+### 1.12 Patch 16：第三轮对抗复核 —— 专审前四次修复的"修复不完全"
+
+**方法**：基线冻结在 HEAD=`d310765`，派四路子进程（SOLO 换号链 / 错误消息语义链 /
+签到写入全入口 / 测试有效性与兼容），目标是**找出修复引入的新问题与遗漏的同类路径**；
+主控独立复核每个关键项并亲跑命令。**四路合计抓到 1 个 P0 + 3 个 P1 + 2 个 P2**，
+另有 1 处主控独立发现的 P1（claim fallback）。
+
+| # | 来源 | 级别 | 缺陷 | 第一现场 | 处置 |
+|---|---|---|---|---|---|
+| 1 | S1+主控 | **P0** | 流中途 4008 带 `solo_received=True` 仍换号 → 重复计费 | `trae_proxy.py:11193`（配额分支在 solo_received 检查之前） | `_solo_quota_exhausted` 开头排除 solo_received；打桩 T2 复现→修复后不换号 |
+| 2 | 主控+S2+S4 | P1 | 失败 message 在 raw=None/空/无 message 时仍退回 `after="success"` | `trae_client.py:1414` | 改用状态码兜底文案 |
+| 3 | S3 | P1 | 刷新与签到并发读-改-写：陈旧 extra 覆盖刚落盘的成功记录 | `trae_proxy.py:1625` | 写前从磁盘重读 checkin 作 prev（不用共锁，避免 pacing sleep 卡住刷新） |
+| 4 | S3+S4 | P1 | 刷新保护测试是"纯数据判定"，删掉生产保护仍 PASS | `_test_review_regressions.py:253` | 重写为真调用 `account_fetch_credits`/`claim_checkin` |
+| 5 | S4+主控 | P2 | 4023 新文案丢 catalog_only 套餐引导；"None"→refactor_planner 误报 | `trae_proxy.py:7766` / `_model_suggestion` | 补回引导；占位词不给建议 |
+| 6 | S1 | P2 | 墙钟上限只管内层重试，不管外层换号（4 号×30s=120s） | `trae_proxy.py:11214` | 换号前也检查上限 |
+
+**冲突裁定**：S2 报「None 无误报」，主控实测字符串 `"None"` → `refactor_planner`。两者口径不同：
+Python `None` 经 `str(None).strip().lower()="none"` 同样会误报——**采信主控**，占位词一律短路返回空。
+S2 报「9074 无退避重试」建议补重试，裁定**不改**：上游明示"参与用户太多"，客户端立即重试会加剧拥挤，
+让用户稍后重试更合理（与 S2 结论一致）。
+
+**测试有效性（skill 硬要求：闸门必须能 FAIL）**：
+- 负向1 去掉 P0 修法 → 流中途 4008 换号判定=True（错误放行）✔
+- 负向2 去掉磁盘重读 → 并发场景 keep=False 会写 false，真函数保留 true ✔
+- 负向3 旧 fallback → message=success（错误放行）✔
+三项证明新测试/新逻辑真能拦住回归。
+
+**验证**：`240 + 65` 测试通过；端到端 SOLO 连打 10/10 成功；4023 提示含建议+套餐引导。

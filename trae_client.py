@@ -1411,7 +1411,12 @@ def claim_checkin(account, realm=None, timeout=30):
             message = "签到失败（上游 %s）：%s" % (
                 claim_code if claim_code not in (None, "") else "?", claim_msg)
         else:
-            message = after.get("message") or "签到未生效"
+            # 即使 claim 没给 message，也**不能**退回 after.message —— 它恒为
+            # "success"（与签到结果无关），会得到「签到未生效：success」。
+            # 用状态码兜底，如实反映「上游拒绝但未说明原因」。
+            code_part = ("（上游 %s）" % claim_code
+                         if claim_code not in (None, "") else "")
+            message = "签到未生效%s（上游未返回原因）" % code_part
     return {"ok": ok, "checked_in": bool(after.get("checked_in")),
             "already": False, "credits": after_credits,
             "earned_credit": earned,
